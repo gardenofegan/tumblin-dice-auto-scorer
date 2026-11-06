@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.png
+zones_config.json
+.pytest_cache/
