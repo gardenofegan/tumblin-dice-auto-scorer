@@ -849,3 +849,252 @@ class MotionDetector:
                 )
 
         return output
+
+
+def run_camera(camera_idx: int = 0, config: Optional[MotionConfig] = None) -> None:
+    """Run live motion detection and quiescence gating from webcam."""
+    if config is None:
+        config = MotionConfig()
+
+    detector = MotionDetector(config)
+    detector.register_on_settle(lambda r: print(f"*** [EVENT] SETTLED: Stillness exceeded {config.quiescence_duration:.1f}s -> Triggering scoring pass! ***"))
+    detector.register_on_motion_start(lambda r: print("*** [EVENT] MOTION DETECTED: Scoreboard frozen while dice tumble! ***"))
+
+    cap = cv2.VideoCapture(camera_idx)
+    if not cap.isOpened():
+        print(f"[ERROR] Could not open camera device index {camera_idx}.")
+        print("Please check your camera connection or try another device index.")
+        return
+
+    window_name = f"Tumblin' Dice Motion Detector (Camera {camera_idx})"
+    print(f"Starting live camera stream on device {camera_idx}...")
+    print("Controls: [q] or [ESC] to quit | [r] to reset | [f] to force settle")
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                print("[WARNING] Empty frame received from camera stream.")
+                time.sleep(0.05)
+                continue
+
+            res = detector.update(frame)
+            overlay = detector.draw_overlay(frame, res)
+
+            # Draw bottom guide line
+            cv2.putText(
+                overlay,
+                "Controls: [q/ESC] Quit | [r] Reset | [f] Force Settle",
+                (20, overlay.shape[0] - 12),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.40,
+                (200, 200, 200),
+                1,
+                cv2.LINE_AA,
+            )
+
+            cv2.imshow(window_name, overlay)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord('q'), ord('Q')):
+                break
+            elif key in (ord('r'), ord('R')):
+                detector.reset()
+                print("[INFO] Detector reset to IDLE.")
+            elif key in (ord('f'), ord('F')):
+                detector.force_settle()
+                print("[INFO] Force settled manually.")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+def run_demo(config: Optional[MotionConfig] = None) -> None:
+    """Run interactive simulated demo demonstrating tumbling dice and quiescence settle."""
+    if config is None:
+        config = MotionConfig()
+
+    detector = MotionDetector(config)
+    detector.register_on_settle(lambda r: print(f"*** [EVENT] SETTLED: Stillness exceeded {config.quiescence_duration:.1f}s -> Triggering scoring pass! ***"))
+    detector.register_on_motion_start(lambda r: print("*** [EVENT] MOTION DETECTED: Scoreboard frozen while dice tumble! ***"))
+
+    window_name = "Tumblin' Dice Motion Detector — Interactive Demo"
+    width, height = 720, 480
+    board_bg = np.zeros((height, width, 3), dtype=np.uint8)
+    # Felt green board background with wooden border
+    board_bg[:] = (40, 95, 45)
+    cv2.rectangle(board_bg, (0, 0), (width, height), (30, 45, 80), 16)
+
+    print("=" * 65)
+    print("Tumblin' Dice Motion & Quiescence Gating Demo")
+    print("=" * 65)
+    print("Demonstrating:")
+    print("  1. ROLLING (MOVING): Dice tumble -> scoreboard freezes")
+    print("  2. SETTLING: Dice come to rest -> stillness accumulated (1.2s)")
+    print("  3. SETTLED: Quiescence achieved -> triggers score calculation")
+    print("\nControls:")
+    print("  [Space] Trigger a new dice roll")
+    print("  [q/ESC] Quit demo")
+    print("=" * 65)
+
+    class DieSimulation:
+        def __init__(self) -> None:
+            self.reset()
+
+        def reset(self) -> None:
+            self.active = True
+            self.x = 60.0
+            self.y = float(height // 2)
+            self.vx = 7.5 + np.random.uniform(1.0, 4.0)
+            self.vy = np.random.uniform(-3.5, 3.5)
+            self.angle = 0.0
+            self.v_rot = np.random.uniform(8.0, 16.0)
+            self.friction = 0.965
+            self.size = 42
+
+        def update(self) -> bool:
+            """Advance simulation physics. Returns True if still moving."""
+            if not self.active:
+                return False
+
+            self.x += self.vx
+            self.y += self.vy
+            self.angle += self.v_rot
+            self.vx *= self.friction
+            self.vy *= self.friction
+            self.v_rot *= self.friction
+
+            # Bounce off edges
+            margin = 35
+            if self.x < margin:
+                self.x = margin
+                self.vx = -self.vx * 0.7
+            elif self.x > width - margin:
+                self.x = width - margin
+                self.vx = -self.vx * 0.7
+
+            if self.y < margin:
+                self.y = margin
+                self.vy = -self.vy * 0.7
+            elif self.y > height - margin:
+                self.y = height - margin
+                self.vy = -self.vy * 0.7
+
+            speed = np.hypot(self.vx, self.vy)
+            if speed < 0.25:
+                self.active = False
+                return False
+            return True
+
+        def draw(self, frame: np.ndarray) -> None:
+            cx, cy = int(self.x), int(self.y)
+            half = self.size // 2
+            # Draw rotated die
+            rect = ((cx, cy), (self.size, self.size), self.angle)
+            box = cv2.boxPoints(rect)
+            box = np.int32(box)
+            cv2.fillPoly(frame, [box], (235, 235, 240))
+            cv2.polylines(frame, [box], True, (30, 30, 30), 2)
+            # Center pip
+            cv2.circle(frame, (cx, cy), 5, (20, 20, 180), -1)
+
+    sim = DieSimulation()
+    auto_restart_time = 0.0
+
+    try:
+        while True:
+            t_now = time.time()
+            frame = board_bg.copy()
+
+            # Advance die physics
+            is_die_moving = sim.update()
+            sim.draw(frame)
+
+            # Update motion detector
+            res = detector.update(frame, timestamp=t_now)
+            overlay = detector.draw_overlay(frame, res)
+
+            # Auto-restart 2.5s after settling to demonstrate continuous play
+            if res.state == MotionState.SETTLED:
+                if auto_restart_time == 0.0:
+                    auto_restart_time = t_now + 2.5
+                elif t_now >= auto_restart_time:
+                    sim.reset()
+                    auto_restart_time = 0.0
+            else:
+                auto_restart_time = 0.0
+
+            # Demo guide text
+            cv2.putText(
+                overlay,
+                "Demo: [Space] New Roll | [q/ESC] Quit",
+                (20, overlay.shape[0] - 12),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (220, 220, 220),
+                1,
+                cv2.LINE_AA,
+            )
+
+            cv2.imshow(window_name, overlay)
+            key = cv2.waitKey(20) & 0xFF
+            if key in (27, ord('q'), ord('Q')):
+                break
+            elif key == ord(' '):
+                sim.reset()
+                print("[INFO] Triggered new simulated dice roll.")
+    finally:
+        cv2.destroyAllWindows()
+
+
+def main() -> None:
+    """CLI entry point for motion detection module."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Tumblin' Dice Motion Detector & Quiescence State Machine"
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Run interactive simulated demo demonstrating tumbling dice and settle gating",
+    )
+    parser.add_argument(
+        "--camera",
+        type=int,
+        nargs="?",
+        const=0,
+        default=None,
+        help="Run live motion detection using webcam device index (default: 0)",
+    )
+    parser.add_argument(
+        "--quiescence",
+        type=float,
+        default=DEFAULT_QUIESCENCE_DURATION,
+        help=f"Quiescence stillness duration in seconds (default: {DEFAULT_QUIESCENCE_DURATION})",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=DEFAULT_MOTION_THRESHOLD,
+        help=f"Motion sensitivity threshold (default: {DEFAULT_MOTION_THRESHOLD})",
+    )
+
+    args = parser.parse_args()
+
+    config = MotionConfig(
+        quiescence_duration=args.quiescence,
+        motion_threshold=args.threshold,
+    )
+
+    if args.camera is not None:
+        run_camera(camera_idx=args.camera, config=config)
+    elif args.demo:
+        run_demo(config=config)
+    else:
+        # If neither is specified, default to running demo mode
+        print("[INFO] No mode specified. Defaulting to interactive simulation demo (--demo).")
+        run_demo(config=config)
+
+
+if __name__ == "__main__":
+    main()
