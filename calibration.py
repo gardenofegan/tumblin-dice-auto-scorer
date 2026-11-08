@@ -1143,7 +1143,13 @@ def main() -> None:
     )
 
     if args.camera is not None:
-        cap = cv2.VideoCapture(args.camera)
+        if sys.platform.startswith("win"):
+            cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap.release()
+                cap = cv2.VideoCapture(args.camera)
+        else:
+            cap = cv2.VideoCapture(args.camera)
         if not cap.isOpened():
             print(f"Error: Could not open camera {args.camera}")
             sys.exit(1)

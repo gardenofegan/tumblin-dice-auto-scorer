@@ -23,6 +23,7 @@ import collections
 from dataclasses import dataclass, field
 from enum import Enum
 import logging
+import sys
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -860,24 +861,47 @@ def run_camera(camera_idx: int = 0, config: Optional[MotionConfig] = None) -> No
     detector.register_on_settle(lambda r: print(f"*** [EVENT] SETTLED: Stillness exceeded {config.quiescence_duration:.1f}s -> Triggering scoring pass! ***"))
     detector.register_on_motion_start(lambda r: print("*** [EVENT] MOTION DETECTED: Scoreboard frozen while dice tumble! ***"))
 
-    cap = cv2.VideoCapture(camera_idx)
+    # On Windows, DirectShow (CAP_DSHOW) avoids MSMF grabFrame -1072875772 errors on webcams like Logitech C920
+    cap = None
+    if sys.platform.startswith("win"):
+        cap = cv2.VideoCapture(camera_idx, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap.release()
+            cap = cv2.VideoCapture(camera_idx)
+    else:
+        cap = cv2.VideoCapture(camera_idx)
+
     if not cap.isOpened():
         print(f"[ERROR] Could not open camera device index {camera_idx}.")
         print("Please check your camera connection or try another device index.")
         return
 
+    # Request smooth 640x480 resolution for low-latency motion detection
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
     window_name = f"Tumblin' Dice Motion Detector (Camera {camera_idx})"
     print(f"Starting live camera stream on device {camera_idx}...")
     print("Controls: [q] or [ESC] to quit | [r] to reset | [f] to force settle")
+
+    consecutive_failures = 0
+    max_consecutive_failures = 20
 
     try:
         while True:
             ret, frame = cap.read()
             if not ret or frame is None:
-                print("[WARNING] Empty frame received from camera stream.")
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    print(f"\n[ERROR] Unable to grab frames from camera {camera_idx} ({max_consecutive_failures} consecutive failures).")
+                    print("Possible causes:")
+                    print("  1. Another application (Zoom, Teams, Discord, OBS, or Windows Camera app) is currently using the camera.")
+                    print("  2. Camera privacy settings in Windows are blocking desktop app access.")
+                    break
                 time.sleep(0.05)
                 continue
 
+            consecutive_failures = 0
             res = detector.update(frame)
             overlay = detector.draw_overlay(frame, res)
 
