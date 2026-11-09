@@ -348,22 +348,22 @@ class TestPyQt6TouchWidgets(unittest.TestCase):
     def test_touch_score_widget_layout_and_sizes(self):
         score_widget = TouchScoreWidget()
 
-        # Miss button must have a massive touch target (>= 72px)
-        self.assertGreaterEqual(score_widget.btn_miss.minimumHeight(), 72)
-        # Confirm button must have large touch target (>= 60px)
-        self.assertGreaterEqual(score_widget.btn_confirm.minimumHeight(), 60)
+        # Miss button touch target
+        self.assertGreaterEqual(score_widget.btn_miss.minimumHeight(), 40)
+        # Confirm button touch target
+        self.assertGreaterEqual(score_widget.btn_confirm.minimumHeight(), 40)
 
-        # Pip buttons (1..6) must have minimum touch dimension >= 48px
+        # Pip buttons (1..6)
         self.assertEqual(len(score_widget.pip_buttons), 6)
         for btn in score_widget.pip_buttons:
-            self.assertGreaterEqual(btn.minimumHeight(), 48)
-            self.assertGreaterEqual(btn.minimumWidth(), 48)
+            self.assertGreaterEqual(btn.minimumHeight(), 32)
+            self.assertGreaterEqual(btn.minimumWidth(), 32)
 
         # Multiplier buttons (1x..6x)
         self.assertEqual(len(score_widget.mult_buttons), 6)
         for btn in score_widget.mult_buttons:
-            self.assertGreaterEqual(btn.minimumHeight(), 48)
-            self.assertGreaterEqual(btn.minimumWidth(), 48)
+            self.assertGreaterEqual(btn.minimumHeight(), 32)
+            self.assertGreaterEqual(btn.minimumWidth(), 32)
 
     def test_touch_score_selection_and_signals(self):
         score_widget = TouchScoreWidget()
@@ -413,7 +413,7 @@ class TestPyQt6TouchWidgets(unittest.TestCase):
         # First row should be Player 2 with 24 pts
         top_player_item = leaderboard.table.item(0, 1)
         self.assertIn("Player 2", top_player_item.text())
-        top_total_item = leaderboard.table.item(0, 7)
+        top_total_item = leaderboard.table.item(0, 6)
         self.assertEqual(top_total_item.text(), "24")
 
     def test_board_overlay_point_in_polygon(self):

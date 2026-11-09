@@ -825,26 +825,27 @@ class LeaderboardWidget(QFrame):
 
         # Leaderboard Table
         self.table = QTableWidget()
-        self.table.setColumnCount(8)
+        self.table.setColumnCount(7)
         self.table.setHorizontalHeaderLabels([
-            "Rank", "Player", "R1", "R2", "R3", "R4", "Round", "Total"
+            "Rank", "Player", "R1", "R2", "R3", "R4", "Total"
         ])
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         # Touch-friendly row height
-        self.table.verticalHeader().setDefaultSectionSize(48)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table.setColumnWidth(0, 60)   # Rank
-        self.table.setColumnWidth(2, 50)   # R1
-        self.table.setColumnWidth(3, 50)   # R2
-        self.table.setColumnWidth(4, 50)   # R3
-        self.table.setColumnWidth(5, 50)   # R4
-        self.table.setColumnWidth(6, 65)   # Round
-        self.table.setColumnWidth(7, 75)   # Total
+        self.table.verticalHeader().setDefaultSectionSize(44)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)  # Player name expands
+        self.table.setColumnWidth(0, 56)   # Rank
+        self.table.setColumnWidth(2, 42)   # R1
+        self.table.setColumnWidth(3, 42)   # R2
+        self.table.setColumnWidth(4, 42)   # R3
+        self.table.setColumnWidth(5, 42)   # R4
+        self.table.setColumnWidth(6, 68)   # Total
 
         layout.addWidget(self.table)
 
@@ -885,11 +886,7 @@ class LeaderboardWidget(QFrame):
             r4 = QTableWidgetItem(str(player.round_score(4)))
             r4.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
-            # Current Round & Total
-            current_r = QTableWidgetItem(str(player.round_score(state.current_round)))
-            current_r.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            current_r.setForeground(QBrush(QColor("#38BDF8")))
-
+            # Total
             total = QTableWidgetItem(str(player.total_score()))
             total.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             total_font = total.font()
@@ -899,7 +896,7 @@ class LeaderboardWidget(QFrame):
 
             # Check if active player
             is_active = (active_player is not None and player.id == active_player.id and not state.is_game_over)
-            row_items = [item_rank, item_player, r1, r2, r3, r4, current_r, total]
+            row_items = [item_rank, item_player, r1, r2, r3, r4, total]
             for col, item in enumerate(row_items):
                 if is_active:
                     item.setBackground(QBrush(QColor("#1E3A8A")))
@@ -932,98 +929,95 @@ class TouchScoreWidget(QFrame):
 
     def init_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(14, 14, 14, 14)
-        layout.setSpacing(12)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(8)
 
-        # 1. Giant Miss Button (Spacebar Override)
+        # 1. Sleek Prominent Miss Button (Spacebar Override)
         self.btn_miss = TouchButton(
             "0 / MISS  [SPACE]",
-            min_height=74,
+            min_height=42,
             parent=self,
         )
         self.btn_miss.setObjectName("missButton")
+        self.btn_miss.setStyleSheet(
+            "background-color: #DC2626; color: #FFFFFF; font-size: 15px; font-weight: 800; "
+            "border-radius: 8px; border: 1px solid #EF4444;"
+        )
         self.btn_miss.setToolTip("Record 0 points (die off board / gutter) and advance turn [Space]")
         self.btn_miss.clicked.connect(self._on_miss_clicked)
         layout.addWidget(self.btn_miss)
 
-        # 2. Pip Selection Row (1..6)
-        pip_box = QVBoxLayout()
-        pip_box.setSpacing(6)
-        lbl_pips = QLabel("SELECT DIE PIP FACE (1–6):")
-        lbl_pips.setStyleSheet("font-size: 13px; font-weight: 700; color: #94A3B8;")
-        pip_box.addWidget(lbl_pips)
+        # 2. Compact Combined Selector Rows: Pips & Multipliers
+        selector_grid = QGridLayout()
+        selector_grid.setContentsMargins(0, 0, 0, 0)
+        selector_grid.setHorizontalSpacing(8)
+        selector_grid.setVerticalSpacing(4)
+
+        lbl_pips = QLabel("PIPS:")
+        lbl_pips.setStyleSheet("font-size: 12px; font-weight: 800; color: #94A3B8; min-width: 45px;")
+        selector_grid.addWidget(lbl_pips, 0, 0)
 
         pip_row = QHBoxLayout()
-        pip_row.setSpacing(8)
+        pip_row.setSpacing(6)
         self.pip_buttons: List[QPushButton] = []
         for i in range(1, 7):
-            btn = TouchButton(str(i), min_height=52, min_width=52)
+            btn = TouchButton(str(i), min_height=36, min_width=38)
             btn.setProperty("class", "gridSelectorBtn")
+            btn.setStyleSheet("font-size: 14px; font-weight: 700;")
             btn.setCheckable(True)
             btn.clicked.connect(lambda checked, val=i: self.select_pip(val))
             pip_row.addWidget(btn)
             self.pip_buttons.append(btn)
-        pip_box.addLayout(pip_row)
-        layout.addLayout(pip_box)
+        selector_grid.addLayout(pip_row, 0, 1)
 
-        # 3. Multiplier Selection Row (1x..6x)
-        mult_box = QVBoxLayout()
-        mult_box.setSpacing(6)
-        lbl_mult = QLabel("SELECT ZONE MULTIPLIER (1x–6x):")
-        lbl_mult.setStyleSheet("font-size: 13px; font-weight: 700; color: #94A3B8;")
-        mult_box.addWidget(lbl_mult)
+        lbl_mult = QLabel("ZONE:")
+        lbl_mult.setStyleSheet("font-size: 12px; font-weight: 800; color: #94A3B8; min-width: 45px;")
+        selector_grid.addWidget(lbl_mult, 1, 0)
 
         mult_row = QHBoxLayout()
-        mult_row.setSpacing(8)
+        mult_row.setSpacing(6)
         self.mult_buttons: List[QPushButton] = []
         for i in range(1, 7):
-            btn = TouchButton(f"{i}x", min_height=52, min_width=52)
+            btn = TouchButton(f"{i}x", min_height=36, min_width=38)
             btn.setProperty("class", "gridSelectorBtn")
+            btn.setStyleSheet("font-size: 14px; font-weight: 700;")
             btn.setCheckable(True)
             btn.clicked.connect(lambda checked, val=i: self.select_multiplier(val))
             mult_row.addWidget(btn)
             self.mult_buttons.append(btn)
-        mult_box.addLayout(mult_row)
-        layout.addLayout(mult_box)
+        selector_grid.addLayout(mult_row, 1, 1)
 
-        # 4. Score Calculation Display & Confirm Button
-        calc_box = QVBoxLayout()
-        calc_box.setSpacing(6)
+        layout.addLayout(selector_grid)
 
-        self.lbl_calc_preview = QLabel("Calculation: 1 pip × 1x = 1 pt")
-        self.lbl_calc_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_calc_preview.setStyleSheet(
-            "font-size: 16px; font-weight: 600; color: #38BDF8; background: #0F172A; "
-            "padding: 8px; border-radius: 8px; border: 1px solid #334155;"
-        )
-        calc_box.addWidget(self.lbl_calc_preview)
+        # 3. Action Bar: Confirm & Undo in clean single row
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
 
         self.btn_confirm = TouchButton(
-            "CONFIRM SCORE: 1 PT [ENTER]",
-            min_height=60,
+            "✓ CONFIRM: 1 PT [ENTER]",
+            min_height=42,
             parent=self,
         )
         self.btn_confirm.setObjectName("confirmButton")
+        self.btn_confirm.setStyleSheet(
+            "background-color: #10B981; color: #042F2E; font-size: 14px; font-weight: 800; "
+            "border-radius: 8px; border: 1px solid #34D399;"
+        )
         self.btn_confirm.clicked.connect(self._on_confirm_clicked)
-        calc_box.addWidget(self.btn_confirm)
-        layout.addLayout(calc_box)
+        action_row.addWidget(self.btn_confirm, stretch=3)
 
-        # 5. Auxiliary Touch Actions: Undo, Next Round
-        aux_row = QHBoxLayout()
-        aux_row.setSpacing(10)
-
-        self.btn_undo = TouchButton("↩ Undo Flick [Ctrl+Z]", min_height=48)
-        self.btn_undo.setStyleSheet("background-color: #475569; font-size: 15px;")
+        self.btn_undo = TouchButton("↩ Undo [Ctrl+Z]", min_height=42, min_width=110)
+        self.btn_undo.setStyleSheet("background-color: #475569; font-size: 13px; font-weight: 600; border-radius: 8px;")
         self.btn_undo.clicked.connect(self.undo_triggered.emit)
-        aux_row.addWidget(self.btn_undo, stretch=1)
+        action_row.addWidget(self.btn_undo, stretch=1)
 
-        self.btn_next_round = TouchButton("Next Round ➔", min_height=48)
-        self.btn_next_round.setStyleSheet("background-color: #2563EB; font-size: 15px;")
+        self.btn_next_round = TouchButton("Next Round ➔", min_height=42, min_width=120)
+        self.btn_next_round.setStyleSheet("background-color: #2563EB; font-size: 14px; font-weight: bold; border-radius: 8px;")
         self.btn_next_round.clicked.connect(self.next_round_triggered.emit)
         self.btn_next_round.setVisible(False)
-        aux_row.addWidget(self.btn_next_round, stretch=1)
+        action_row.addWidget(self.btn_next_round, stretch=1)
 
-        layout.addLayout(aux_row)
+        layout.addLayout(action_row)
 
         # Set default selections
         self.select_pip(1)
@@ -1045,10 +1039,11 @@ class TouchScoreWidget(QFrame):
 
     def _update_calculation_preview(self) -> None:
         pts = self.selected_pip * self.selected_multiplier
-        self.lbl_calc_preview.setText(
-            f"Calculation: {self.selected_pip} pips × {self.selected_multiplier}x = {pts} pts"
-        )
-        self.btn_confirm.setText(f"CONFIRM SCORE: {pts} PTS [ENTER]")
+        if hasattr(self, "lbl_calc_preview"):
+            self.lbl_calc_preview.setText(
+                f"Calculation: {self.selected_pip} pips × {self.selected_multiplier}x = {pts} pts"
+            )
+        self.btn_confirm.setText(f"✓ CONFIRM: {pts} PTS [ENTER]")
 
     def _on_confirm_clicked(self) -> None:
         score = self.selected_pip * self.selected_multiplier
@@ -1078,7 +1073,8 @@ class BoardOverlayWidget(QFrame):
         super().__init__(parent)
         self.setObjectName("boardOverlayWidget")
         self.setProperty("class", "cardFrame")
-        self.setMinimumSize(280, 360)
+        self.setMinimumSize(200, 200)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.config_path = config_path
         self.board_width = 800
         self.board_height = 1200
@@ -1388,20 +1384,21 @@ class TumblinDiceHUD(QMainWindow):
         right_container = QWidget()
         right_layout = QVBoxLayout(right_container)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(12)
+        right_layout.setSpacing(8)
 
-        # Board & Zone Preview
+        # Board & Zone Preview (Expands to fill available vertical space)
         self.board_overlay = BoardOverlayWidget(config_path=self.config_path, parent=self)
         self.board_overlay.zone_selected.connect(self._on_board_zone_clicked)
-        right_layout.addWidget(self.board_overlay, stretch=3)
+        right_layout.addWidget(self.board_overlay, stretch=1)
 
-        # Touch Controls Panel
+        # Compact Touch Controls Panel (Fixed sleek height, no overlap or scroll)
         self.touch_controls = TouchScoreWidget(self)
+        self.touch_controls.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         self.touch_controls.score_confirmed.connect(self.record_score)
         self.touch_controls.miss_triggered.connect(self.on_miss_override)
         self.touch_controls.undo_triggered.connect(self.on_undo_clicked)
         self.touch_controls.next_round_triggered.connect(self.advance_round)
-        right_layout.addWidget(self.touch_controls, stretch=4)
+        right_layout.addWidget(self.touch_controls, stretch=0)
 
         splitter.addWidget(right_container)
         splitter.setStretchFactor(0, 4)
