@@ -1604,3 +1604,380 @@ def create_synthetic_board(
                 })
 
     return board, placed_dice_meta
+
+
+# =============================================================================
+# 10. Interactive Visual Demo & Live Camera CLI Entrypoint
+# =============================================================================
+
+def generate_random_demo_board(
+    num_dice: int = 5,
+    seed: Optional[int] = None,
+    width: int = 800,
+    height: int = 1200,
+) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+    """Generates a synthetic board populated with random colored dice."""
+    import random
+
+    if seed is not None:
+        random.seed(seed)
+
+    player_specs = [
+        (1, "Player 1 (Red)", (30, 30, 220)),
+        (2, "Player 2 (Blue)", (220, 100, 30)),
+        (3, "Player 3 (Green)", (50, 205, 50)),
+        (4, "Player 4 (Yellow)", (0, 215, 255)),
+    ]
+
+    dice_specs: List[Dict[str, Any]] = []
+    for i in range(num_dice):
+        pid, name, bg = player_specs[i % len(player_specs)]
+        cx = random.randint(140, width - 140)
+        cy = random.randint(220, height - 120)
+        pips = random.randint(1, 6)
+        angle = random.uniform(-40.0, 40.0)
+        size = random.randint(52, 62)
+        dice_specs.append({
+            "cx": cx,
+            "cy": cy,
+            "size": size,
+            "pips": pips,
+            "bg_color": bg,
+            "fg_color": (255, 255, 255),
+            "angle": angle,
+            "player_id": pid,
+        })
+
+    return create_synthetic_board(width=width, height=height, dice_specs=dice_specs)
+
+
+def run_demo(
+    config_path: str = "zones_config.json",
+    headless: bool = False,
+    output_path: Optional[str] = None,
+) -> None:
+    """
+    Runs interactive visual demo displaying synthetic dice detection,
+    pip counting, player color clustering, zone multiplier scoring, and HUD overlay.
+    """
+    import random
+
+    print("=" * 68)
+    print(" Tumblin' Dice Detection & Pip Scoring — Interactive Demo")
+    print("=" * 68)
+    print("Demonstrating:")
+    print("  1. HSV color clustering & player identification (Red, Blue, Green, Yellow)")
+    print("  2. High-accuracy D6 pip pattern recognition (1..6 dots)")
+    print("  3. Point-in-polygon zone multiplier scoring (1x..4x, Gutter 0pts)")
+    print("  4. Live broadcast HUD overlay with score badges & ranked leaderboard")
+    print("-" * 68)
+    print("Controls:")
+    print("  [Space]     Roll / generate new random dice layout")
+    print("  [1..4]      Add a die for Player 1 (Red), 2 (Blue), 3 (Green), or 4 (Yellow)")
+    print("  [c]         Clear all dice from the board")
+    print("  [s]         Save current annotated HUD frame to screenshot")
+    print("  [q / ESC]   Quit demo")
+    print("=" * 68)
+
+    # Initialize scoring zones
+    zone_scorer = ZoneScorer()
+    if os.path.exists(config_path):
+        try:
+            zone_scorer.set_zones(config_path)
+            print(f"[INFO] Loaded {len(zone_scorer.zones)} scoring zones from {config_path}")
+        except Exception as e:
+            print(f"[WARN] Could not load zones from {config_path}: {e}. Using default.")
+
+    pipeline = DetectionPipeline(zone_scorer=zone_scorer)
+
+    # State: list of active dice specs
+    active_specs: List[Dict[str, Any]] = []
+
+    def populate_initial_dice() -> None:
+        nonlocal active_specs
+        player_specs = [
+            (1, (30, 30, 220)),
+            (2, (220, 100, 30)),
+            (3, (50, 205, 50)),
+            (4, (0, 215, 255)),
+        ]
+        active_specs = [
+            # Die in 1x zone
+            {"cx": 200, "cy": 500, "size": 56, "pips": 4, "bg_color": player_specs[0][1], "player_id": 1, "angle": 12.0},
+            # Die in 2x zone
+            {"cx": 480, "cy": 540, "size": 56, "pips": 6, "bg_color": player_specs[1][1], "player_id": 2, "angle": -15.0},
+            # Die in 3x zone
+            {"cx": 620, "cy": 760, "size": 56, "pips": 5, "bg_color": player_specs[2][1], "player_id": 3, "angle": 5.0},
+            # Die in 4x zone
+            {"cx": 700, "cy": 1050, "size": 56, "pips": 3, "bg_color": player_specs[3][1], "player_id": 4, "angle": -25.0},
+            # Extra die in gutter / out of bounds
+            {"cx": 70, "cy": 220, "size": 54, "pips": 2, "bg_color": player_specs[0][1], "player_id": 1, "angle": 30.0},
+        ]
+
+    populate_initial_dice()
+
+    def render_current_scene() -> Tuple[DiceScoringResult, np.ndarray]:
+        board, _ = create_synthetic_board(width=800, height=1200, dice_specs=active_specs)
+        result, hud = pipeline.process_frame(board)
+
+        # Draw interactive banner across the bottom of the HUD
+        h, w = hud.shape[:2]
+        banner_h = 42
+        cv2.rectangle(hud, (0, h - banner_h), (w, h), (20, 20, 20), -1)
+        cv2.line(hud, (0, h - banner_h), (w, h - banner_h), (80, 80, 80), 1)
+        instructions = "[Space] New Roll | [1..4] Add Die | [c] Clear | [s] Save | [q/ESC] Quit"
+        cv2.putText(
+            hud,
+            instructions,
+            (16, h - 14),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (240, 240, 240),
+            1,
+            cv2.LINE_AA,
+        )
+        return result, hud
+
+    # Headless / automated mode
+    if headless:
+        result, hud = render_current_scene()
+        target = output_path or "demo_detection.png"
+        cv2.imwrite(target, hud)
+        print(f"[INFO] Headless demo complete. Output saved to: {target}")
+        print(f"[INFO] Dice detected: {len(result.dice)}, Total score: {result.total_board_score}")
+        for entry in result.leaderboard:
+            print(f"       Rank {entry.get('rank')}: {entry.get('name')} ({entry.get('color_name')}) -> {entry.get('total_score')} pts")
+        return
+
+    window_name = "Tumblin' Dice Detection & Scoring — Interactive Demo"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 720, 1000)
+
+    try:
+        while True:
+            result, hud = render_current_scene()
+            cv2.imshow(window_name, hud)
+            key = cv2.waitKey(30) & 0xFF
+
+            if key in (27, ord("q"), ord("Q")):
+                break
+            elif key == 32:  # Space - Randomize board
+                num = random.randint(3, 7)
+                _, random_meta = generate_random_demo_board(num_dice=num)
+                active_specs = []
+                player_colors = {
+                    1: (30, 30, 220),
+                    2: (220, 100, 30),
+                    3: (50, 205, 50),
+                    4: (0, 215, 255),
+                }
+                for m in random_meta:
+                    pid = m.get("player_id", 1)
+                    bx, by, bw, bh = m.get("bbox", (200, 200, 56, 56))
+                    active_specs.append({
+                        "cx": bx + bw // 2,
+                        "cy": by + bh // 2,
+                        "size": bw,
+                        "pips": m.get("pips", 1),
+                        "bg_color": player_colors.get(pid, (30, 30, 220)),
+                        "player_id": pid,
+                        "angle": random.uniform(-40, 40),
+                    })
+                print(f"[ACTION] Rolled {len(active_specs)} new random dice onto board.")
+            elif key in (ord("1"), ord("2"), ord("3"), ord("4")):
+                pid = int(chr(key))
+                player_colors = {
+                    1: (30, 30, 220),
+                    2: (220, 100, 30),
+                    3: (50, 205, 50),
+                    4: (0, 215, 255),
+                }
+                cx = random.randint(160, 640)
+                cy = random.randint(300, 1100)
+                pips = random.randint(1, 6)
+                active_specs.append({
+                    "cx": cx,
+                    "cy": cy,
+                    "size": random.randint(52, 60),
+                    "pips": pips,
+                    "bg_color": player_colors[pid],
+                    "player_id": pid,
+                    "angle": random.uniform(-35, 35),
+                })
+                print(f"[ACTION] Added die for Player {pid} (Pips: {pips}) at ({cx}, {cy}).")
+            elif key in (ord("c"), ord("C")):
+                active_specs.clear()
+                print("[ACTION] Cleared all dice from the board.")
+            elif key in (ord("s"), ord("S")):
+                save_file = "demo_detection_screenshot.png"
+                cv2.imwrite(save_file, hud)
+                print(f"[ACTION] Saved screenshot to {os.path.abspath(save_file)}")
+    finally:
+        cv2.destroyAllWindows()
+
+
+def run_camera(
+    camera_idx: int = 0,
+    config_path: str = "zones_config.json",
+    calibrate: bool = False,
+) -> None:
+    """
+    Runs live dice detection and scoring from an attached camera device.
+    Supports Windows DirectShow backend to prevent MSMF video frame errors.
+    """
+    import sys
+
+    print("=" * 68)
+    print(f" Tumblin' Dice Live Camera Mode (Device Index: {camera_idx})")
+    print("=" * 68)
+    if calibrate:
+        print(" [CALIBRATION MODE]")
+        print(" Click on any die in the video feed to sample its HSV color profile.")
+    print(" Press [q / ESC] to exit camera feed.")
+    print("=" * 68)
+
+    # Initialize camera with DirectShow on Windows for reliability
+    cap = None
+    if sys.platform.startswith("win"):
+        cap = cv2.VideoCapture(camera_idx, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            cap.release()
+            cap = cv2.VideoCapture(camera_idx)
+    else:
+        cap = cv2.VideoCapture(camera_idx)
+
+    if not cap.isOpened():
+        print(f"[ERROR] Could not open camera device index {camera_idx}.")
+        print("Please check your camera connection or try another device index (e.g. --camera 1).")
+        return
+
+    # Initialize zones and pipeline
+    zone_scorer = ZoneScorer()
+    if os.path.exists(config_path):
+        try:
+            zone_scorer.set_zones(config_path)
+            print(f"[INFO] Loaded zones from {config_path}")
+        except Exception as e:
+            print(f"[WARN] Could not load zones from {config_path}: {e}")
+
+    pipeline = DetectionPipeline(zone_scorer=zone_scorer)
+    window_name = f"Tumblin' Dice Live Camera — Device {camera_idx}"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+
+    last_click: Optional[Tuple[int, int]] = None
+
+    def on_mouse(event: int, x: int, y: int, flags: int, param: Any) -> None:
+        nonlocal last_click
+        if event == cv2.EVENT_LBUTTONDOWN and calibrate:
+            last_click = (x, y)
+
+    cv2.setMouseCallback(window_name, on_mouse)
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                print("[WARN] Failed to grab frame from camera.")
+                break
+
+            # Handle calibration click
+            if last_click is not None and calibrate:
+                cx, cy = last_click
+                last_click = None
+                # Sample 20x20 patch around click
+                x1 = max(0, cx - 10)
+                y1 = max(0, cy - 10)
+                x2 = min(frame.shape[1], cx + 10)
+                y2 = min(frame.shape[0], cy + 10)
+                patch = frame[y1:y2, x1:x2]
+                if patch.size > 0:
+                    sampler = HSVColorSampler()
+                    hsv_stats = sampler.sample_color_from_roi(patch, exclude_pips=False)
+                    print(f"[CALIBRATE] Sampled at ({cx}, {cy}): Hue={hsv_stats.mean_hue:.1f}, Sat={hsv_stats.mean_sat:.1f}, Val={hsv_stats.mean_val:.1f}")
+
+            # Process frame through pipeline
+            try:
+                result, hud = pipeline.process_frame(frame)
+            except Exception as e:
+                hud = frame.copy()
+                cv2.putText(hud, f"Processing Error: {e}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            cv2.imshow(window_name, hud)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q"), ord("Q")):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+
+def main() -> None:
+    """CLI entry point for Tumblin' Dice detection module."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Tumblin' Dice Computer Vision Detection & Scoring Module"
+    )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Run interactive visual demo displaying synthetic dice detection, pip counting, and scoring HUD",
+    )
+    parser.add_argument(
+        "--camera",
+        type=int,
+        nargs="?",
+        const=0,
+        default=None,
+        help="Run live dice detection using webcam device index (default: 0)",
+    )
+    parser.add_argument(
+        "--calibrate-colors",
+        action="store_true",
+        help="Enable interactive color calibration mode when running with --camera",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="zones_config.json",
+        help="Path to scoring zones JSON configuration file (default: zones_config.json)",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run demo in headless mode (no GUI window, writes output image and logs to console)",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Destination path for output image when running with --headless",
+    )
+
+    args = parser.parse_args()
+
+    if args.camera is not None:
+        run_camera(
+            camera_idx=args.camera,
+            config_path=args.config,
+            calibrate=args.calibrate_colors,
+        )
+    elif args.demo:
+        run_demo(
+            config_path=args.config,
+            headless=args.headless,
+            output_path=args.output,
+        )
+    else:
+        # Default to interactive demo mode
+        print("[INFO] No mode specified. Defaulting to interactive simulation demo (--demo).")
+        run_demo(
+            config_path=args.config,
+            headless=args.headless,
+            output_path=args.output,
+        )
+
+
+if __name__ == "__main__":
+    main()
+
