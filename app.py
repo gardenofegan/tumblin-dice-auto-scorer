@@ -26,7 +26,17 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from PyQt6.QtCore import QEvent, QObject, QPointF, QRectF, QSize, Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import (
+    QEvent,
+    QObject,
+    QPointF,
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+    pyqtSignal,
+    pyqtSlot,
+)
 from PyQt6.QtGui import (
     QBrush,
     QColor,
@@ -1328,6 +1338,7 @@ class TumblinDiceHUD(QMainWindow):
         self,
         state: Optional[GameState] = None,
         config_path: str = DEFAULT_CONFIG_PATH,
+        mock_feed: bool = False,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -1338,6 +1349,13 @@ class TumblinDiceHUD(QMainWindow):
 
         self.state = state if state is not None else GameState()
         self.config_path = config_path
+        self.mock_feed = mock_feed
+
+        # Mock feed automated timer
+        self.mock_timer = QTimer(self)
+        self.mock_timer.setInterval(2800)
+        self.mock_timer.timeout.connect(self.trigger_mock_flick)
+        self.mock_auto_running = False
 
         # Install global event filter to intercept Spacebar anywhere in the app
         app = QApplication.instance()
@@ -1409,6 +1427,24 @@ class TumblinDiceHUD(QMainWindow):
         btn_new_game.clicked.connect(self.confirm_new_game)
         bottom_bar.addWidget(btn_new_game)
 
+        if self.mock_feed:
+            lbl_mock_badge = QLabel("⚡ MOCK FEED")
+            lbl_mock_badge.setStyleSheet(
+                "background-color: #1E3A8A; color: #60A5FA; font-weight: bold; font-size: 13px; "
+                "padding: 4px 10px; border-radius: 6px; border: 1px solid #3B82F6;"
+            )
+            bottom_bar.addWidget(lbl_mock_badge)
+
+            self.btn_mock_roll = TouchButton("🎲 Mock Roll", min_height=44, min_width=115)
+            self.btn_mock_roll.setStyleSheet("background-color: #2563EB; font-size: 14px; font-weight: bold;")
+            self.btn_mock_roll.clicked.connect(self.trigger_mock_flick)
+            bottom_bar.addWidget(self.btn_mock_roll)
+
+            self.btn_mock_toggle = TouchButton("▶ Auto Roll", min_height=44, min_width=115)
+            self.btn_mock_toggle.setStyleSheet("background-color: #059669; font-size: 14px; font-weight: bold;")
+            self.btn_mock_toggle.clicked.connect(self.toggle_mock_feed_auto)
+            bottom_bar.addWidget(self.btn_mock_toggle)
+
         root_layout.addLayout(bottom_bar)
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
@@ -1424,12 +1460,20 @@ class TumblinDiceHUD(QMainWindow):
                     return False
                 self.on_miss_override()
                 return True
+            elif key_event.key() == Qt.Key.Key_M and self.mock_feed and not key_event.isAutoRepeat():
+                if not isinstance(watched, QLineEdit):
+                    self.trigger_mock_flick()
+                    return True
         return super().eventFilter(watched, event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         """Window-level keyboard shortcuts for rapid laptop or tablet keyboard use."""
         if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
             self.on_miss_override()
+            event.accept()
+            return
+        elif event.key() == Qt.Key.Key_M and self.mock_feed and not event.isAutoRepeat():
+            self.trigger_mock_flick()
             event.accept()
             return
         elif event.key() in (Qt.Key.Key_1, Qt.Key.Key_2, Qt.Key.Key_3, Qt.Key.Key_4, Qt.Key.Key_5, Qt.Key.Key_6):
@@ -1500,8 +1544,56 @@ class TumblinDiceHUD(QMainWindow):
                 f"Round {self.state.current_round} complete! Clear physical dice from board and start Round {next_r}."
             )
             self.touch_controls.set_round_complete_mode(True, next_round_num=next_r)
+            if self.mock_feed and hasattr(self, "mock_timer") and self.mock_timer.isActive():
+                QTimer.singleShot(2200, self.advance_round)
         else:
             self.touch_controls.set_round_complete_mode(False)
+
+    @pyqtSlot()
+    def trigger_mock_flick(self) -> None:
+        """Simulates an incoming computer vision detection event."""
+        if self.state.is_game_over:
+            if hasattr(self, "mock_timer") and self.mock_timer.isActive():
+                self.mock_timer.stop()
+            return
+
+        turn = self.state.get_current_turn()
+        if not turn:
+            return
+        player, flick_num = turn
+
+        import random
+        # 12% chance of miss / gutter
+        is_miss = (random.random() < 0.12)
+        if is_miss:
+            self.on_miss_override()
+            self.lbl_status.setText(f"[MOCK FEED] ❌ Gutter Miss (0 pts) recorded for {player.name} [Flick {flick_num}]")
+        else:
+            pips = random.randint(1, 6)
+            mult = random.choice([1, 2, 3, 4])
+            score = pips * mult
+            self.record_score(score=score, pips=pips, multiplier=mult)
+            self.lbl_status.setText(f"[MOCK FEED] 🎯 Detected {player.name}: {pips} pips × {mult}x = {score} pts [Flick {flick_num}]")
+
+    @pyqtSlot()
+    def toggle_mock_feed_auto(self) -> None:
+        """Toggles automated roll feed timer on/off."""
+        if not hasattr(self, "mock_timer"):
+            return
+        if self.mock_timer.isActive():
+            self.mock_timer.stop()
+            self.mock_auto_running = False
+            if hasattr(self, "btn_mock_toggle"):
+                self.btn_mock_toggle.setText("▶ Auto Roll")
+                self.btn_mock_toggle.setStyleSheet("background-color: #059669; font-size: 14px; font-weight: bold;")
+            self.lbl_status.setText("[MOCK FEED] Auto-roll paused. Click '🎲 Mock Roll' or press [M] to step.")
+        else:
+            self.mock_timer.start()
+            self.mock_auto_running = True
+            if hasattr(self, "btn_mock_toggle"):
+                self.btn_mock_toggle.setText("⏸ Pause Feed")
+                self.btn_mock_toggle.setStyleSheet("background-color: #D97706; font-size: 14px; font-weight: bold;")
+            self.lbl_status.setText("[MOCK FEED] Auto-roll running (every 2.8s). Watch snake turns & round transitions!")
 
     @pyqtSlot()
     def advance_round(self) -> None:
@@ -1572,6 +1664,11 @@ def main() -> None:
     parser.add_argument("--players", type=int, default=4, help="Number of players (1..10)")
     parser.add_argument("--config", type=str, default=DEFAULT_CONFIG_PATH, help="Path to zones_config.json")
     parser.add_argument("--fullscreen", action="store_true", help="Launch in fullscreen mode")
+    parser.add_argument(
+        "--mock-feed",
+        action="store_true",
+        help="Launch HUD with simulated roll feed and interactive mock controls",
+    )
     args = parser.parse_args()
 
     app = QApplication.instance()
@@ -1581,11 +1678,15 @@ def main() -> None:
     state = GameState()
     state._init_default_players(args.players)
 
-    window = TumblinDiceHUD(state=state, config_path=args.config)
+    window = TumblinDiceHUD(state=state, config_path=args.config, mock_feed=args.mock_feed)
     if args.fullscreen:
         window.showFullScreen()
     else:
         window.show()
+
+    if args.mock_feed:
+        # Start auto roll automatically when launched with --mock-feed
+        window.toggle_mock_feed_auto()
 
     sys.exit(app.exec())
 

@@ -594,6 +594,30 @@ class TestTumblinDiceHUDIntegration(unittest.TestCase):
         self.assertEqual(self.hud.touch_controls.selected_multiplier, 5)
         self.assertIn("Selected 5x zone", self.hud.lbl_status.text())
 
+    def test_mock_feed_initialization_and_controls(self):
+        mock_hud = TumblinDiceHUD(state=GameState(), mock_feed=True)
+        self.assertTrue(mock_hud.mock_feed)
+        self.assertTrue(hasattr(mock_hud, "btn_mock_roll"))
+        self.assertTrue(hasattr(mock_hud, "btn_mock_toggle"))
+
+        # Test toggling mock feed
+        mock_hud.toggle_mock_feed_auto()
+        self.assertTrue(mock_hud.mock_auto_running)
+        self.assertTrue(mock_hud.mock_timer.isActive())
+
+        mock_hud.toggle_mock_feed_auto()
+        self.assertFalse(mock_hud.mock_auto_running)
+        self.assertFalse(mock_hud.mock_timer.isActive())
+        mock_hud.close()
+
+    def test_trigger_mock_flick_advances_game(self):
+        mock_hud = TumblinDiceHUD(state=GameState(), mock_feed=True)
+        initial_flicks = len(mock_hud.state.history)
+
+        mock_hud.trigger_mock_flick()
+        self.assertEqual(len(mock_hud.state.history), initial_flicks + 1)
+        self.assertIn("[MOCK FEED]", mock_hud.lbl_status.text())
+        mock_hud.close()
 
 
 if __name__ == "__main__":
