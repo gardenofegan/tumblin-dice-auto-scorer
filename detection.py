@@ -1865,6 +1865,7 @@ def run_camera(
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     last_click: Optional[Tuple[int, int]] = None
+    last_calib_info: Optional[Tuple[Tuple[int, int], str]] = None
 
     def on_mouse(event: int, x: int, y: int, flags: int, param: Any) -> None:
         nonlocal last_click
@@ -1884,16 +1885,23 @@ def run_camera(
             if last_click is not None and calibrate:
                 cx, cy = last_click
                 last_click = None
-                # Sample 20x20 patch around click
-                x1 = max(0, cx - 10)
-                y1 = max(0, cy - 10)
-                x2 = min(frame.shape[1], cx + 10)
-                y2 = min(frame.shape[0], cy + 10)
+                # Sample 24x24 patch around click
+                x1 = max(0, cx - 12)
+                y1 = max(0, cy - 12)
+                x2 = min(frame.shape[1], cx + 12)
+                y2 = min(frame.shape[0], cy + 12)
                 patch = frame[y1:y2, x1:x2]
                 if patch.size > 0:
                     sampler = HSVColorSampler()
-                    hsv_stats = sampler.sample_color_from_roi(patch, exclude_pips=False)
-                    print(f"[CALIBRATE] Sampled at ({cx}, {cy}): Hue={hsv_stats.mean_hue:.1f}, Sat={hsv_stats.mean_sat:.1f}, Val={hsv_stats.mean_val:.1f}")
+                    try:
+                        h_mean, s_mean, v_mean = sampler.sample_color_from_roi(patch, exclude_pips=False)
+                        matched_prof, dist = pipeline.player_manager.match_color((h_mean, s_mean, v_mean))
+                        match_text = f"{matched_prof.name} ({matched_prof.color_name}) [dist={dist:.1f}]" if matched_prof else f"No profile match [dist={dist:.1f}]"
+                        calib_text = f"H:{h_mean:.1f} S:{s_mean:.1f} V:{v_mean:.1f} -> {match_text}"
+                        print(f"[CALIBRATE] Clicked ({cx}, {cy}): {calib_text}")
+                        last_calib_info = ((cx, cy), calib_text)
+                    except Exception as err:
+                        print(f"[CALIBRATE] Error sampling color at ({cx}, {cy}): {err}")
 
             # Process frame through pipeline
             try:
@@ -1901,6 +1909,33 @@ def run_camera(
             except Exception as e:
                 hud = frame.copy()
                 cv2.putText(hud, f"Processing Error: {e}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            # Draw calibration overlay if in calibration mode
+            if calibrate:
+                cv2.putText(
+                    hud,
+                    "CALIBRATION: Click any physical die to sample HSV & match player",
+                    (16, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                if last_calib_info is not None:
+                    (pt_x, pt_y), info_str = last_calib_info
+                    cv2.circle(hud, (pt_x, pt_y), 16, (0, 255, 255), 2, cv2.LINE_AA)
+                    cv2.circle(hud, (pt_x, pt_y), 3, (0, 255, 255), -1, cv2.LINE_AA)
+                    cv2.putText(
+                        hud,
+                        info_str,
+                        (max(10, pt_x - 120), max(25, pt_y - 24)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (0, 255, 255),
+                        2,
+                        cv2.LINE_AA,
+                    )
 
             cv2.imshow(window_name, hud)
             key = cv2.waitKey(1) & 0xFF
