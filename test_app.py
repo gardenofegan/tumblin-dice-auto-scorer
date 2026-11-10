@@ -794,17 +794,21 @@ class TestVisionPipelineThread(unittest.TestCase):
 
         self.assertEqual(len(settle_events), 0)
 
-        # 2. Static frame (settling begins)
+        # 2. Static frames (settling begins and accumulates stillness)
         final_dice = [{"cx": 400, "cy": 540, "size": 60, "pips": 4, "bg_color": (30, 30, 220), "player_id": 1}]
         b_static, _ = create_synthetic_board(800, 1200, dice_specs=final_dice, zones=thread.zones)
         b_static[0:180, 0:180] = sheet[0:180, 0:180]
         b_static[0:180, 620:800] = sheet[0:180, 620:800]
         b_static[1020:1200, 620:800] = sheet[1020:1200, 620:800]
         b_static[1020:1200, 0:180] = sheet[1020:1200, 0:180]
+
+        # First static frame transitions MOVING -> SETTLING (motion diff relative to moving frame is still non-zero)
         thread._process_single_frame(b_static, timestamp=0.4)
+        # Second static frame: identical frames so movement score drops to 0, stillness timer starts at 0.5
+        thread._process_single_frame(b_static, timestamp=0.5)
         self.assertEqual(len(settle_events), 0)
 
-        # 3. Static frame after quiescence duration (0.4 + 0.4 = 0.8s)
+        # 3. Third static frame after quiescence duration (0.5 + 0.35s = 0.85s >= 0.3s)
         thread._process_single_frame(b_static, timestamp=0.85)
 
         self.assertEqual(len(settle_events), 1)

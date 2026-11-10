@@ -732,17 +732,37 @@ class DeltaDieScorer:
         bumped_dice: List[Tuple[DetectedDie, DetectedDie]] = []
         displaced_score_delta = 0
 
-        # Build distance pairs between previous dice and valid current dice
+        # Build candidate pairs between previous dice and valid current dice.
+        # Prefer matching dice of the same player_id; if player_id is known and matches,
+        # distance threshold is extended or prioritized over cross-player matching.
         pairs = []
         for p_idx, p_die in enumerate(self.previous_dice):
             for c_idx, c_die in enumerate(valid_current):
                 dist = math.hypot(p_die.center[0] - c_die.center[0], p_die.center[1] - c_die.center[1])
-                if dist <= self.match_distance_threshold:
-                    pairs.append((dist, p_idx, c_idx))
+                same_player = (
+                    p_die.player_id is not None
+                    and c_die.player_id is not None
+                    and p_die.player_id == c_die.player_id
+                )
+                diff_player = (
+                    p_die.player_id is not None
+                    and c_die.player_id is not None
+                    and p_die.player_id != c_die.player_id
+                )
 
-        # Greedy nearest-neighbor matching
-        pairs.sort(key=lambda x: x[0])
-        for dist, p_idx, c_idx in pairs:
+                # If dice have explicitly different player IDs, do not match them as the same physical die
+                if diff_player:
+                    continue
+
+                # For same player, allow bumping across zones even if displacement is larger
+                effective_threshold = self.match_distance_threshold * 4.0 if same_player else self.match_distance_threshold
+                if dist <= effective_threshold:
+                    priority = 0 if same_player else 1
+                    pairs.append((priority, dist, p_idx, c_idx))
+
+        # Greedy matching prioritizing same player then nearest distance
+        pairs.sort(key=lambda x: (x[0], x[1]))
+        for _, dist, p_idx, c_idx in pairs:
             if p_idx not in matched_prev_indices and c_idx not in matched_curr_indices:
                 matched_prev_indices.add(p_idx)
                 matched_curr_indices.add(c_idx)
