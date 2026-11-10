@@ -20,11 +20,15 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sys
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import cv2
+import numpy as np
 
 from PyQt6.QtCore import (
     QEvent,
@@ -33,6 +37,7 @@ from PyQt6.QtCore import (
     QRectF,
     QSize,
     Qt,
+    QThread,
     QTimer,
     pyqtSignal,
     pyqtSlot,
@@ -42,10 +47,12 @@ from PyQt6.QtGui import (
     QColor,
     QFont,
     QIcon,
+    QImage,
     QKeyEvent,
     QPainter,
     QPainterPath,
     QPen,
+    QPixmap,
     QPolygonF,
 )
 from PyQt6.QtWidgets import (
@@ -72,6 +79,34 @@ from PyQt6.QtWidgets import (
 )
 
 logger = logging.getLogger(__name__)
+
+from calibration import (
+    DEFAULT_BOARD_HEIGHT,
+    DEFAULT_BOARD_WIDTH,
+    ArucoCalibrator,
+    ScoringZone,
+    ZoneManager,
+    generate_aruco_calibration_sheet,
+)
+from detection import (
+    DEFAULT_PLAYER_ROSTER,
+    D6PipCounter,
+    DetectedDie,
+    DiceDetector,
+    DiceScoringResult,
+    DetectionPipeline,
+    HSVColorSampler,
+    PlayerProfileManager,
+    ZoneScorer,
+    create_synthetic_board,
+    create_synthetic_die,
+)
+from motion import (
+    MotionConfig,
+    MotionDetector,
+    MotionResult,
+    MotionState,
+)
 
 # ============================================================================
 # Game Constants & Defaults
@@ -622,6 +657,537 @@ class GameState:
 
 
 # ============================================================================
+# Computer Vision Delta Scoring & Background Video Pipeline
+# ============================================================================
+
+@dataclass
+class DeltaScoringResult:
+    """
+    Result container produced when comparing the settled board state against
+    prior resting dice to isolate the active player's newly flicked die and any bumps.
+    """
+    new_die: Optional[DetectedDie] = None
+    bumped_dice: List[Tuple[DetectedDie, DetectedDie]] = field(default_factory=list)
+    pips: int = 0
+    multiplier: int = 0
+    score: int = 0
+    is_miss: bool = False
+    displaced_score_delta: int = 0
+    total_delta_score: int = 0
+    raw_dice_count: int = 0
+    previous_dice_count: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "pips": self.pips,
+            "multiplier": self.multiplier,
+            "score": self.score,
+            "is_miss": self.is_miss,
+            "displaced_score_delta": self.displaced_score_delta,
+            "total_delta_score": self.total_delta_score,
+            "raw_dice_count": self.raw_dice_count,
+            "previous_dice_count": self.previous_dice_count,
+            "new_die": self.new_die.to_dict() if self.new_die else None,
+        }
+
+
+class DeltaDieScorer:
+    """
+    Maintains baseline resting dice across flicks within each major round.
+    Computes spatial and multiplier deltas once motion quiescence is reached,
+    isolating the newly flicked die, bump/displacement score adjustments,
+    and gutter miss events.
+    """
+
+    def __init__(self, match_distance_threshold: float = 75.0) -> None:
+        self.match_distance_threshold = float(match_distance_threshold)
+        self.previous_dice: List[DetectedDie] = []
+
+    def reset_round(self) -> None:
+        """Clears baseline resting dice when a major round starts or board is cleared."""
+        self.previous_dice.clear()
+
+    def set_baseline(self, dice: Sequence[DetectedDie]) -> None:
+        """Explicitly sets resting dice baseline."""
+        self.previous_dice = list(dice)
+
+    def undo_last_flick(self) -> None:
+        """Rolls back the last added die from baseline if present."""
+        if self.previous_dice:
+            self.previous_dice.pop()
+
+    def compute_delta(
+        self,
+        current_dice: Sequence[DetectedDie],
+        active_player_id: Optional[int] = None,
+    ) -> DeltaScoringResult:
+        """
+        Compares currently detected dice against previous resting dice.
+        Returns DeltaScoringResult detailing new die, bumps, and flick score.
+        """
+        valid_current = [d for d in current_dice if not d.is_out_of_bounds and d.zone_multiplier > 0]
+
+        matched_curr_indices = set()
+        matched_prev_indices = set()
+        bumped_dice: List[Tuple[DetectedDie, DetectedDie]] = []
+        displaced_score_delta = 0
+
+        # Build distance pairs between previous dice and valid current dice
+        pairs = []
+        for p_idx, p_die in enumerate(self.previous_dice):
+            for c_idx, c_die in enumerate(valid_current):
+                dist = math.hypot(p_die.center[0] - c_die.center[0], p_die.center[1] - c_die.center[1])
+                if dist <= self.match_distance_threshold:
+                    pairs.append((dist, p_idx, c_idx))
+
+        # Greedy nearest-neighbor matching
+        pairs.sort(key=lambda x: x[0])
+        for dist, p_idx, c_idx in pairs:
+            if p_idx not in matched_prev_indices and c_idx not in matched_curr_indices:
+                matched_prev_indices.add(p_idx)
+                matched_curr_indices.add(c_idx)
+                prev_die = self.previous_dice[p_idx]
+                curr_die = valid_current[c_idx]
+
+                # Check if zone or multiplier changed (bumped die)
+                if curr_die.zone_multiplier != prev_die.zone_multiplier or dist > 20.0:
+                    bumped_dice.append((prev_die, curr_die))
+                    displaced_score_delta += (curr_die.score - prev_die.score)
+
+        # Unmatched dice in valid_current are candidate new dice
+        unmatched_curr = [
+            c_die for c_idx, c_die in enumerate(valid_current)
+            if c_idx not in matched_curr_indices
+        ]
+
+        # Select new die
+        new_die: Optional[DetectedDie] = None
+        if unmatched_curr:
+            if active_player_id is not None:
+                player_matched = [d for d in unmatched_curr if d.player_id == active_player_id]
+                if player_matched:
+                    new_die = player_matched[0]
+                else:
+                    new_die = min(unmatched_curr, key=lambda d: getattr(d, "color_distance", 0.0))
+            else:
+                new_die = unmatched_curr[0]
+
+        if new_die is not None:
+            pips = new_die.pip_count
+            multiplier = new_die.zone_multiplier
+            score = pips * multiplier
+            is_miss = False
+        else:
+            pips = 0
+            multiplier = 0
+            score = 0
+            is_miss = True
+
+        total_delta = score + displaced_score_delta
+
+        res = DeltaScoringResult(
+            new_die=new_die,
+            bumped_dice=bumped_dice,
+            pips=pips,
+            multiplier=multiplier,
+            score=score,
+            is_miss=is_miss,
+            displaced_score_delta=displaced_score_delta,
+            total_delta_score=total_delta,
+            raw_dice_count=len(valid_current),
+            previous_dice_count=len(self.previous_dice),
+        )
+
+        # Update baseline resting dice
+        self.previous_dice = list(valid_current)
+        return res
+
+
+class VisionPipelineThread(QThread):
+    """
+    Background QThread linking ArUco perspective warp, motion quiescence settle detection,
+    and HSV dice detection directly into the live scoreboard HUD.
+    
+    Supports:
+    - Real camera device input (--camera [DEVICE_INDEX]) using Windows DirectShow backend.
+    - Interactive software simulation mode (--mock-feed) with animated tumbling dice.
+    - Automatic perspective warping via 4 corner ArUco fiducials.
+    - Quiescence gating: scoreboard freeze during active motion ('Rolling...'),
+      accumulated stillness tracking ('Settling...'), and real-time settle triggers.
+    - Delta die scoring isolating active player flicks and bumps.
+    """
+
+    frame_ready = pyqtSignal(np.ndarray)       # Processed board frame with HUD annotations
+    raw_frame_ready = pyqtSignal(np.ndarray)   # Raw unrectified camera frame
+    motion_status = pyqtSignal(object)         # MotionResult object
+    settle_event = pyqtSignal(object)          # DeltaScoringResult object
+    calibration_status = pyqtSignal(bool)      # True if ArUco board homography is locked
+    error_occurred = pyqtSignal(str)          # Error notification string
+
+    def __init__(
+        self,
+        camera_idx: Optional[int] = None,
+        mock_feed: bool = False,
+        config_path: str = DEFAULT_CONFIG_PATH,
+        quiescence_duration: float = 1.2,
+        parent: Optional[QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.camera_idx = camera_idx
+        self.mock_feed = mock_feed
+        self.config_path = config_path
+        self.quiescence_duration = float(quiescence_duration)
+
+        self._running = False
+        self._paused = False
+        self._active_player_id: int = 1
+        self._active_player_color: str = "#EF4444"
+
+        # Dimensions & Zone Configuration
+        self.board_width = DEFAULT_BOARD_WIDTH
+        self.board_height = DEFAULT_BOARD_HEIGHT
+        self.zones: List[ScoringZone] = []
+        self._load_zones()
+
+        # Calibration (ArUco fiducials)
+        self.calibrator = ArucoCalibrator(
+            board_width=self.board_width,
+            board_height=self.board_height,
+        )
+
+        # Motion detector with quiescence gating
+        self.motion_detector = MotionDetector(
+            config=MotionConfig(
+                quiescence_duration=self.quiescence_duration,
+                motion_threshold=400.0,
+            )
+        )
+
+        # Player profile manager and zone scorer
+        self.player_manager = PlayerProfileManager.create_default_roster(10)
+        self.zone_scorer = ZoneScorer(zones_source=self.zones)
+        self.detection_pipeline = DetectionPipeline(
+            player_manager=self.player_manager,
+            zone_scorer=self.zone_scorer,
+        )
+
+        # Delta die scoring engine
+        self.delta_scorer = DeltaDieScorer()
+
+        # Mock simulation state
+        self._mock_sheet = generate_aruco_calibration_sheet(self.board_width, self.board_height)
+        self._mock_placed_dice: List[Dict[str, Any]] = []
+        self._mock_rolling = False
+        self._mock_roll_start_time = 0.0
+        self._mock_roll_duration = 0.7
+        self._mock_current_roll: Optional[Dict[str, Any]] = None
+        self._mock_last_settle_time = time.time()
+        self.mock_auto_running = False
+        self._last_warped: Optional[np.ndarray] = None
+
+    def _load_zones(self) -> None:
+        """Loads zones from configuration file or applies default fallback tiered zones."""
+        if os.path.exists(self.config_path):
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                dims = data.get("board_dimensions", {})
+                self.board_width = dims.get("width", DEFAULT_BOARD_WIDTH)
+                self.board_height = dims.get("height", DEFAULT_BOARD_HEIGHT)
+                for z_data in data.get("zones", []):
+                    try:
+                        self.zones.append(ScoringZone.from_dict(z_data))
+                    except Exception:
+                        pass
+                if self.zones:
+                    return
+            except Exception as e:
+                logger.warning("Could not load zones from %s: %s", self.config_path, e)
+
+        # Fallback tiered zones
+        self.zones = [
+            ScoringZone("Zone 1x", 1, [(100, 200), (700, 200), (700, 400), (100, 400)], (255, 140, 0)),
+            ScoringZone("Zone 2x", 2, [(100, 400), (700, 400), (700, 650), (100, 650)], (50, 205, 50)),
+            ScoringZone("Zone 3x", 3, [(100, 650), (700, 650), (700, 900), (100, 900)], (30, 30, 220)),
+            ScoringZone("Zone 4x", 4, [(100, 900), (700, 900), (700, 1100), (100, 1100)], (0, 165, 255)),
+        ]
+
+    def set_active_player(self, player_id: int, color_hex: str) -> None:
+        """Updates active player context for color matching and delta scoring."""
+        self._active_player_id = int(player_id)
+        self._active_player_color = str(color_hex)
+
+    def reset_round(self) -> None:
+        """Resets baseline dice tracking and clears mock board for a new major round."""
+        self.delta_scorer.reset_round()
+        self._mock_placed_dice.clear()
+        self._mock_rolling = False
+        self._mock_current_roll = None
+        self._mock_last_settle_time = time.time()
+
+    def undo_flick(self) -> None:
+        """Rolls back the last flick from delta scoring baseline and mock board."""
+        self.delta_scorer.undo_last_flick()
+        if self._mock_placed_dice:
+            self._mock_placed_dice.pop()
+
+    def trigger_mock_flick(self) -> None:
+        """Triggers a simulated dice roll event in software simulation mode."""
+        if self._mock_rolling:
+            return
+
+        import random
+        prof = self.player_manager.get_profile(self._active_player_id)
+        bg_color = prof.display_bgr if prof else (30, 30, 220)
+
+        # 12% gutter miss chance
+        is_miss = (random.random() < 0.12)
+        if is_miss:
+            target_cx = random.choice([30, 770])
+            target_cy = random.randint(1100, 1180)
+            pips = random.randint(1, 6)
+        else:
+            target_mult = random.choice([1, 2, 3, 4])
+            target_cy = 280 + target_mult * 200 + random.randint(-40, 40)
+            target_cx = random.randint(220, 580)
+            pips = random.randint(1, 6)
+
+        self._mock_current_roll = {
+            "cx": target_cx,
+            "cy": target_cy,
+            "size": 60,
+            "pips": pips,
+            "bg_color": bg_color,
+            "player_id": self._active_player_id,
+            "is_miss": is_miss,
+            "start_cx": random.randint(320, 480),
+            "start_cy": 130,
+        }
+        self._mock_roll_start_time = time.time()
+        self._mock_rolling = True
+
+    def add_mock_die(self, pips: int, multiplier: int, x: float, y: float, player_id: int) -> None:
+        """Directly adds a placed die to the mock simulation scene."""
+        prof = self.player_manager.get_profile(player_id)
+        bg = prof.display_bgr if prof else (30, 30, 220)
+        self._mock_placed_dice.append({
+            "cx": int(x),
+            "cy": int(y),
+            "size": 60,
+            "pips": int(pips),
+            "bg_color": bg,
+            "player_id": int(player_id),
+            "is_miss": False,
+        })
+
+    def force_settle(self) -> None:
+        """Forces an immediate settle detection pass on current frame."""
+        if self._last_warped is not None:
+            warped = self._last_warped
+        else:
+            warped = np.full((self.board_height, self.board_width, 3), 200, dtype=np.uint8)
+        scoring_res, _ = self.detection_pipeline.process_frame(warped)
+        delta = self.delta_scorer.compute_delta(
+            scoring_res.dice,
+            active_player_id=self._active_player_id,
+        )
+        self.settle_event.emit(delta)
+
+    def pause(self) -> None:
+        """Pauses frame processing loop."""
+        self._paused = True
+
+    def resume(self) -> None:
+        """Resumes frame processing loop."""
+        self._paused = False
+
+    def stop(self, timeout_ms: int = 2000) -> None:
+        """Stops the thread gracefully and waits for termination."""
+        self._running = False
+        self.wait(timeout_ms)
+
+    def start(self, priority: QThread.Priority = QThread.Priority.InheritPriority) -> None:
+        """Starts background worker thread."""
+        self._running = True
+        super().start(priority)
+
+    def run(self) -> None:
+        """Main execution loop."""
+        if not self._running:
+            return
+        if self.mock_feed or self.camera_idx is None:
+            self._run_mock_loop()
+        else:
+            self._run_camera_loop()
+
+    def _run_camera_loop(self) -> None:
+        """Captures frames from physical camera device and processes pipeline."""
+        camera_idx = self.camera_idx if self.camera_idx is not None else 0
+        cap = None
+        if sys.platform.startswith("win"):
+            cap = cv2.VideoCapture(camera_idx, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                if cap is not None:
+                    cap.release()
+                cap = cv2.VideoCapture(camera_idx)
+        else:
+            cap = cv2.VideoCapture(camera_idx)
+
+        if not cap.isOpened():
+            err = f"Could not open camera device index {camera_idx}"
+            logger.error(err)
+            self.error_occurred.emit(err)
+            self._running = False
+            return
+
+        try:
+            while self._running:
+                if self._paused:
+                    time.sleep(0.05)
+                    continue
+
+                ret, frame = cap.read()
+                if not ret or frame is None or frame.size == 0:
+                    time.sleep(0.02)
+                    continue
+
+                self._process_single_frame(frame)
+                time.sleep(0.03)  # ~30 FPS
+        finally:
+            if cap is not None:
+                cap.release()
+
+    def _run_mock_loop(self) -> None:
+        """Generates synthetic video feed with ArUco markers, tumbling dice, and settle events."""
+        while self._running:
+            if self._paused:
+                time.sleep(0.05)
+                continue
+
+            now = time.time()
+
+            # Handle auto roll interval
+            if self.mock_auto_running and not self._mock_rolling:
+                if (now - self._mock_last_settle_time) > 2.8:
+                    self.trigger_mock_flick()
+
+            # Build current frame dice specs
+            current_dice_specs = list(self._mock_placed_dice)
+
+            if self._mock_rolling and self._mock_current_roll:
+                elapsed = now - self._mock_roll_start_time
+                progress = min(1.0, elapsed / self._mock_roll_duration)
+
+                if progress < 1.0:
+                    s_cx = self._mock_current_roll["start_cx"]
+                    s_cy = self._mock_current_roll["start_cy"]
+                    e_cx = self._mock_current_roll["cx"]
+                    e_cy = self._mock_current_roll["cy"]
+                    wobble = math.sin(progress * 12.0) * 20.0
+                    curr_cx = int(s_cx + progress * (e_cx - s_cx) + wobble)
+                    curr_cy = int(s_cy + progress * (e_cy - s_cy))
+                    angle = progress * 720.0
+
+                    rolling_spec = dict(self._mock_current_roll)
+                    rolling_spec["cx"] = curr_cx
+                    rolling_spec["cy"] = curr_cy
+                    rolling_spec["angle"] = angle
+                    current_dice_specs.append(rolling_spec)
+                else:
+                    self._mock_rolling = False
+                    if not self._mock_current_roll.get("is_miss", False):
+                        self._mock_placed_dice.append(dict(self._mock_current_roll))
+
+            # Render synthetic board image
+            board_img, _ = create_synthetic_board(
+                width=self.board_width,
+                height=self.board_height,
+                dice_specs=current_dice_specs,
+                zones=self.zones,
+            )
+
+            # Stamp ArUco fiducials at the corners
+            sheet = self._mock_sheet
+            board_img[0:180, 0:180] = sheet[0:180, 0:180]
+            board_img[0:180, self.board_width - 180 : self.board_width] = sheet[0:180, self.board_width - 180 : self.board_width]
+            board_img[self.board_height - 180 : self.board_height, self.board_width - 180 : self.board_width] = sheet[self.board_height - 180 : self.board_height, self.board_width - 180 : self.board_width]
+            board_img[self.board_height - 180 : self.board_height, 0:180] = sheet[self.board_height - 180 : self.board_height, 0:180]
+
+            self._process_single_frame(board_img, timestamp=now)
+            time.sleep(0.035)  # ~28 FPS
+
+    def _process_single_frame(self, raw_frame: np.ndarray, timestamp: Optional[float] = None) -> None:
+        """Processes a single camera/synthetic frame through the complete multi-stage pipeline."""
+        now = timestamp if timestamp is not None else time.time()
+        self.raw_frame_ready.emit(raw_frame)
+
+        # 1. ArUco Marker Detection & Perspective Homography Warp
+        if self.calibrator.homography_matrix is None:
+            calib_success = self.calibrator.calibrate_from_frame(raw_frame)
+            self.calibration_status.emit(calib_success)
+
+        if self.calibrator.homography_matrix is not None:
+            try:
+                warped = self.calibrator.warp_frame(raw_frame)
+            except Exception:
+                warped = cv2.resize(raw_frame, (self.board_width, self.board_height))
+        else:
+            warped = cv2.resize(raw_frame, (self.board_width, self.board_height))
+
+        self._last_warped = warped
+
+        # 2. Motion Quiescence Gating & Settle Detection
+        motion_res = self.motion_detector.process_frame(warped, timestamp=now)
+        self.motion_status.emit(motion_res)
+
+        # 3. Real-Time Settle Trigger & Delta Die Scoring
+        if motion_res.just_settled:
+            self._mock_last_settle_time = now
+            scoring_res, _ = self.detection_pipeline.process_frame(warped)
+            delta = self.delta_scorer.compute_delta(
+                scoring_res.dice,
+                active_player_id=self._active_player_id,
+            )
+            self.settle_event.emit(delta)
+
+        # 4. Render Live HUD Broadcast Frame
+        annotated = self._render_live_hud(warped, motion_res)
+        self.frame_ready.emit(annotated)
+
+    def _render_live_hud(self, warped: np.ndarray, motion_res: MotionResult) -> np.ndarray:
+        """Renders live broadcast HUD overlays directly on the rectified board image."""
+        output = warped.copy()
+
+        # 1. Overlay scoring zones
+        if self.zone_scorer.zone_manager:
+            output = self.zone_scorer.zone_manager.render_overlay(output, alpha=0.22)
+
+        # 2. Overlay detected dice badges from last snapshot
+        if self.detection_pipeline.current_result:
+            for d in self.detection_pipeline.current_result.dice:
+                if d.zone_multiplier > 0 and not d.is_out_of_bounds:
+                    color = d.display_bgr if d.player_id else (255, 255, 255)
+                    cx, cy = int(d.center[0]), int(d.center[1])
+                    cv2.circle(output, (cx, cy), 30, color, 3, cv2.LINE_AA)
+                    cv2.circle(output, (cx, cy), 3, (255, 255, 255), -1, cv2.LINE_AA)
+                    pname = d.player_name or f"Player {d.player_id}"
+                    badge = f"{pname}: {d.pip_count}x{d.zone_multiplier}={d.score}pts"
+                    cv2.putText(output, badge, (max(10, cx - 60), max(25, cy - 36)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 3, cv2.LINE_AA)
+                    cv2.putText(output, badge, (max(10, cx - 60), max(25, cy - 36)), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # 3. Motion status overlay and quiescence progress bar
+        output = self.motion_detector.draw_overlay(output, motion_res)
+
+        # 4. ArUco homography lock badge
+        is_cal = (self.calibrator.homography_matrix is not None)
+        cal_text = "ArUco: Calibrated & Warped" if is_cal else "ArUco: Scanning for fiducials..."
+        cal_col = (50, 205, 50) if is_cal else (0, 165, 255)
+        cv2.putText(output, cal_text, (self.board_width - 290, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.52, cal_col, 1, cv2.LINE_AA)
+
+        return output
+
+
+# ============================================================================
 # Surface-Optimized UI Widgets
 # ============================================================================
 
@@ -1080,7 +1646,20 @@ class BoardOverlayWidget(QFrame):
         self.board_height = 1200
         self.zones: List[Dict[str, Any]] = []
         self.active_dice: List[Dict[str, Any]] = []
+        self.latest_frame: Optional[np.ndarray] = None
+        self.latest_qimage: Optional[QImage] = None
         self.load_zones()
+
+    def set_camera_frame(self, frame: np.ndarray) -> None:
+        """Updates the live camera video frame displayed on the board."""
+        if frame is None or frame.size == 0:
+            return
+        self.latest_frame = frame
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_frame.shape
+        bytes_per_line = ch * w
+        self.latest_qimage = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
+        self.update()
 
     def load_zones(self) -> None:
         """Loads scoring zones and board dimensions from zones_config.json if available."""
@@ -1146,7 +1725,7 @@ class BoardOverlayWidget(QFrame):
         return bx, by
 
     def paintEvent(self, event: Any) -> None:
-        """Paints the board background, polygon zones, and placed dice pins."""
+        """Paints the board background, polygon zones, and placed dice pins or live camera feed."""
         super().paintEvent(event)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -1155,56 +1734,64 @@ class BoardOverlayWidget(QFrame):
         top_left_x, top_left_y = self._board_to_widget_coords(0, 0)
         bot_right_x, bot_right_y = self._board_to_widget_coords(self.board_width, self.board_height)
         board_rect = QRectF(top_left_x, top_left_y, bot_right_x - top_left_x, bot_right_y - top_left_y)
-        painter.fillRect(board_rect, QColor("#111827"))
-        painter.setPen(QPen(QColor("#38BDF8"), 2))
-        painter.drawRect(board_rect)
 
-        # Draw Zones
-        for zone in self.zones:
-            pts = zone.get("points", [])
-            if len(pts) < 3:
-                continue
-            poly = QPolygonF()
-            centroid_x, centroid_y = 0.0, 0.0
-            for pt in pts:
-                wx, wy = self._board_to_widget_coords(pt[0], pt[1])
-                poly.append(QPointF(wx, wy))
-                centroid_x += wx
-                centroid_y += wy
-            centroid_x /= len(pts)
-            centroid_y /= len(pts)
+        if self.latest_qimage is not None and not self.latest_qimage.isNull():
+            # Draw live camera / warped video feed
+            painter.drawImage(board_rect, self.latest_qimage)
+            painter.setPen(QPen(QColor("#38BDF8"), 2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(board_rect)
+        else:
+            painter.fillRect(board_rect, QColor("#111827"))
+            painter.setPen(QPen(QColor("#38BDF8"), 2))
+            painter.drawRect(board_rect)
 
-            raw_col = zone.get("color", [0, 180, 255])
-            # Handle RGB vs BGR safely
-            fill_col = QColor(raw_col[0], raw_col[1], raw_col[2], 75)
-            stroke_col = QColor(raw_col[0], raw_col[1], raw_col[2], 220)
+            # Draw Zones
+            for zone in self.zones:
+                pts = zone.get("points", [])
+                if len(pts) < 3:
+                    continue
+                poly = QPolygonF()
+                centroid_x, centroid_y = 0.0, 0.0
+                for pt in pts:
+                    wx, wy = self._board_to_widget_coords(pt[0], pt[1])
+                    poly.append(QPointF(wx, wy))
+                    centroid_x += wx
+                    centroid_y += wy
+                centroid_x /= len(pts)
+                centroid_y /= len(pts)
 
-            painter.setBrush(QBrush(fill_col))
-            painter.setPen(QPen(stroke_col, 2))
-            painter.drawPolygon(poly)
+                raw_col = zone.get("color", [0, 180, 255])
+                # Handle RGB vs BGR safely
+                fill_col = QColor(raw_col[0], raw_col[1], raw_col[2], 75)
+                stroke_col = QColor(raw_col[0], raw_col[1], raw_col[2], 220)
 
-            # Zone label
-            mult = zone.get("multiplier", 1)
-            painter.setPen(QPen(QColor("#FFFFFF")))
-            painter.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
-            painter.drawText(
-                QRectF(centroid_x - 30, centroid_y - 15, 60, 30),
-                Qt.AlignmentFlag.AlignCenter,
-                f"{mult}x",
-            )
+                painter.setBrush(QBrush(fill_col))
+                painter.setPen(QPen(stroke_col, 2))
+                painter.drawPolygon(poly)
 
-        # Draw Placed Dice
-        for die in self.active_dice:
-            wx, wy = self._board_to_widget_coords(die["x"], die["y"])
-            die_rect = QRectF(wx - 14, wy - 14, 28, 28)
-            painter.setBrush(QBrush(QColor(die["color"])))
-            painter.setPen(QPen(QColor("#FFFFFF"), 2))
-            painter.drawRoundedRect(die_rect, 6, 6)
+                # Zone label
+                mult = zone.get("multiplier", 1)
+                painter.setPen(QPen(QColor("#FFFFFF")))
+                painter.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+                painter.drawText(
+                    QRectF(centroid_x - 30, centroid_y - 15, 60, 30),
+                    Qt.AlignmentFlag.AlignCenter,
+                    f"{mult}x",
+                )
 
-            # Draw pip text
-            painter.setPen(QPen(QColor("#000000") if die["color"] == "#E2E8F0" else QColor("#FFFFFF")))
-            painter.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-            painter.drawText(die_rect, Qt.AlignmentFlag.AlignCenter, str(die["pips"]))
+            # Draw Placed Dice
+            for die in self.active_dice:
+                wx, wy = self._board_to_widget_coords(die["x"], die["y"])
+                die_rect = QRectF(wx - 14, wy - 14, 28, 28)
+                painter.setBrush(QBrush(QColor(die["color"])))
+                painter.setPen(QPen(QColor("#FFFFFF"), 2))
+                painter.drawRoundedRect(die_rect, 6, 6)
+
+                # Draw pip text
+                painter.setPen(QPen(QColor("#000000") if die["color"] == "#E2E8F0" else QColor("#FFFFFF")))
+                painter.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+                painter.drawText(die_rect, Qt.AlignmentFlag.AlignCenter, str(die["pips"]))
 
         painter.end()
 
@@ -1334,7 +1921,9 @@ class TumblinDiceHUD(QMainWindow):
         self,
         state: Optional[GameState] = None,
         config_path: str = DEFAULT_CONFIG_PATH,
+        camera_idx: Optional[int] = None,
         mock_feed: bool = False,
+        quiescence_duration: float = 1.2,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -1345,7 +1934,10 @@ class TumblinDiceHUD(QMainWindow):
 
         self.state = state if state is not None else GameState()
         self.config_path = config_path
+        self.camera_idx = camera_idx
         self.mock_feed = mock_feed
+        self.quiescence_duration = float(quiescence_duration)
+        self.vision_thread: Optional[VisionPipelineThread] = None
 
         # Mock feed automated timer
         self.mock_timer = QTimer(self)
@@ -1359,7 +1951,33 @@ class TumblinDiceHUD(QMainWindow):
             app.installEventFilter(self)
 
         self.init_ui()
+
+        # Initialize background vision QThread if camera or mock feed specified
+        if self.camera_idx is not None or self.mock_feed:
+            self.init_vision_pipeline()
+
         self.refresh_all_views()
+
+    def init_vision_pipeline(self) -> None:
+        """Initializes and launches the background vision QThread."""
+        self.vision_thread = VisionPipelineThread(
+            camera_idx=self.camera_idx,
+            mock_feed=self.mock_feed,
+            config_path=self.config_path,
+            quiescence_duration=self.quiescence_duration,
+            parent=self,
+        )
+        self.vision_thread.frame_ready.connect(self.board_overlay.set_camera_frame)
+        self.vision_thread.motion_status.connect(self.on_motion_status)
+        self.vision_thread.settle_event.connect(self.on_vision_settle)
+        self.vision_thread.calibration_status.connect(self.on_calibration_status)
+        self.vision_thread.error_occurred.connect(self.on_vision_error)
+
+        turn = self.state.get_current_turn()
+        if turn:
+            self.vision_thread.set_active_player(turn[0].id, turn[0].color)
+
+        self.vision_thread.start()
 
     def init_ui(self) -> None:
         central = QWidget(self)
@@ -1423,6 +2041,27 @@ class TumblinDiceHUD(QMainWindow):
         btn_new_game.setStyleSheet("background-color: #334155; font-size: 14px;")
         btn_new_game.clicked.connect(self.confirm_new_game)
         bottom_bar.addWidget(btn_new_game)
+
+        # Calibrator status badge
+        self.lbl_cal_badge = QLabel("🎯 ArUco")
+        self.lbl_cal_badge.setStyleSheet(
+            "background-color: #1E293B; color: #94A3B8; font-weight: bold; font-size: 13px; "
+            "padding: 4px 10px; border-radius: 6px; border: 1px solid #475569;"
+        )
+        bottom_bar.addWidget(self.lbl_cal_badge)
+
+        if self.camera_idx is not None:
+            self.lbl_cam_badge = QLabel(f"📷 CAM {self.camera_idx}")
+            self.lbl_cam_badge.setStyleSheet(
+                "background-color: #064E3B; color: #34D399; font-weight: bold; font-size: 13px; "
+                "padding: 4px 10px; border-radius: 6px; border: 1px solid #059669;"
+            )
+            bottom_bar.addWidget(self.lbl_cam_badge)
+
+            self.btn_force_settle = TouchButton("⚡ Settle Frame", min_height=44, min_width=120)
+            self.btn_force_settle.setStyleSheet("background-color: #D97706; font-size: 14px; font-weight: bold;")
+            self.btn_force_settle.clicked.connect(self.on_force_settle_clicked)
+            bottom_bar.addWidget(self.btn_force_settle)
 
         if self.mock_feed:
             lbl_mock_badge = QLabel("⚡ MOCK FEED")
@@ -1505,7 +2144,14 @@ class TumblinDiceHUD(QMainWindow):
         self.refresh_all_views()
 
     @pyqtSlot(int, int, int)
-    def record_score(self, score: int, pips: int, multiplier: int) -> None:
+    def record_score(
+        self,
+        score: int,
+        pips: int,
+        multiplier: int,
+        die_x: Optional[float] = None,
+        die_y: Optional[float] = None,
+    ) -> None:
         """Records a scored flick and places a simulated die pin on the board visualizer."""
         if self.state.is_game_over:
             return
@@ -1518,15 +2164,105 @@ class TumblinDiceHUD(QMainWindow):
         record = self.state.record_flick(score=score, pips=pips, multiplier=multiplier)
 
         # Place die pin on board
-        sim_x = 200 + (flick_num * 80 + player.id * 35) % 400
-        sim_y = 250 + (multiplier * 140) % 750
-        self.board_overlay.add_die_pin(sim_x, sim_y, player.color, pips, multiplier)
+        if die_x is not None and die_y is not None:
+            pin_x, pin_y = float(die_x), float(die_y)
+        else:
+            pin_x = float(200 + (flick_num * 80 + player.id * 35) % 400)
+            pin_y = float(250 + (multiplier * 140) % 750)
+
+        self.board_overlay.add_die_pin(pin_x, pin_y, player.color, pips, multiplier)
+
+        # Sync placed die to mock vision thread if active
+        if self.vision_thread is not None and self.mock_feed:
+            self.vision_thread.add_mock_die(pips, multiplier, pin_x, pin_y, player.id)
 
         self.lbl_status.setText(
             f"✓ {player.name} scored {score} pts ({pips} pips × {multiplier}x) [Flick {flick_num}]"
         )
         self._check_round_or_game_transition()
         self.refresh_all_views()
+
+    @pyqtSlot(object)
+    def on_motion_status(self, motion_res: MotionResult) -> None:
+        """Handles real-time motion state updates from background vision thread."""
+        if self.state.is_game_over:
+            return
+
+        turn = self.state.get_current_turn()
+        player_str = turn[0].name if turn else "Ready"
+
+        if motion_res.state == MotionState.MOVING:
+            self.lbl_status.setText(
+                f"⚡ [ROLLING...] Active dice motion detected for {player_str} - Scoreboard frozen."
+            )
+            self.lbl_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #F59E0B;")
+        elif motion_res.state == MotionState.SETTLING:
+            pct = int(motion_res.quiescence_progress * 100)
+            self.lbl_status.setText(
+                f"⏳ [SETTLING...] Waiting for dice stillness: {pct}% stillness ({motion_res.stillness_duration:.1f}s / {self.quiescence_duration:.1f}s)"
+            )
+            self.lbl_status.setStyleSheet("font-size: 14px; font-weight: 600; color: #38BDF8;")
+        elif motion_res.state == MotionState.SETTLED:
+            self.lbl_status.setStyleSheet("font-size: 14px; color: #34D399;")
+
+    @pyqtSlot(object)
+    def on_vision_settle(self, delta: DeltaScoringResult) -> None:
+        """Handles real-time settle trigger from background vision thread with delta scoring."""
+        if self.state.is_game_over or self.state.is_current_round_complete():
+            return
+
+        turn = self.state.get_current_turn()
+        if not turn:
+            return
+        player, flick_num = turn
+
+        if delta.is_miss:
+            self.on_miss_override()
+            self.lbl_status.setText(
+                f"🎯 [VISION SETTLE] ❌ Gutter Miss (0 pts) recorded for {player.name} [Flick {flick_num}]"
+            )
+        else:
+            die_x = delta.new_die.center[0] if delta.new_die else None
+            die_y = delta.new_die.center[1] if delta.new_die else None
+            self.record_score(
+                score=delta.score,
+                pips=delta.pips,
+                multiplier=delta.multiplier,
+                die_x=die_x,
+                die_y=die_y,
+            )
+            self.lbl_status.setText(
+                f"🎯 [VISION SETTLE] ✓ {player.name}: {delta.pips} pips × {delta.multiplier}x = {delta.score} pts [Flick {flick_num}]"
+            )
+
+    @pyqtSlot(bool)
+    def on_calibration_status(self, is_calibrated: bool) -> None:
+        """Updates ArUco homography lock badge."""
+        if hasattr(self, "lbl_cal_badge"):
+            if is_calibrated:
+                self.lbl_cal_badge.setText("🎯 ArUco Warped")
+                self.lbl_cal_badge.setStyleSheet(
+                    "background-color: #064E3B; color: #34D399; font-weight: bold; font-size: 13px; "
+                    "padding: 4px 10px; border-radius: 6px; border: 1px solid #059669;"
+                )
+            else:
+                self.lbl_cal_badge.setText("🎯 ArUco Scan")
+                self.lbl_cal_badge.setStyleSheet(
+                    "background-color: #1E293B; color: #94A3B8; font-weight: bold; font-size: 13px; "
+                    "padding: 4px 10px; border-radius: 6px; border: 1px solid #475569;"
+                )
+
+    @pyqtSlot(str)
+    def on_vision_error(self, err_msg: str) -> None:
+        """Handles background vision pipeline errors."""
+        self.lbl_status.setText(f"[VISION ERROR] {err_msg}")
+        self.lbl_status.setStyleSheet("font-size: 14px; font-weight: bold; color: #EF4444;")
+
+    @pyqtSlot()
+    def on_force_settle_clicked(self) -> None:
+        """Referee manual override to force a vision settle pass."""
+        if self.vision_thread is not None:
+            self.vision_thread.force_settle()
 
     def _check_round_or_game_transition(self) -> None:
         """Checks if current major round ended or if game is complete."""
@@ -1597,6 +2333,8 @@ class TumblinDiceHUD(QMainWindow):
         """Starts the next major round and clears board dice visualizer."""
         if self.state.advance_to_next_round():
             self.board_overlay.clear_dice()
+            if self.vision_thread is not None:
+                self.vision_thread.reset_round()
             self.lbl_status.setText(
                 f"Round {self.state.current_round} began! Order: {self.state.get_round_direction_name(self.state.current_round)}"
             )
@@ -1607,6 +2345,8 @@ class TumblinDiceHUD(QMainWindow):
     def on_undo_clicked(self) -> None:
         """Rolls back the most recent flick score."""
         if self.state.undo():
+            if self.vision_thread is not None:
+                self.vision_thread.undo_flick()
             self.lbl_status.setText("Undid last flick action.")
             self._check_round_or_game_transition()
             self.refresh_all_views()
@@ -1626,6 +2366,8 @@ class TumblinDiceHUD(QMainWindow):
             new_players = dialog.get_configured_players()
             self.state.reset_game(new_players)
             self.board_overlay.clear_dice()
+            if self.vision_thread is not None:
+                self.vision_thread.reset_round()
             self.refresh_all_views()
             self.lbl_status.setText("Player roster updated. New game started.")
 
@@ -1641,6 +2383,8 @@ class TumblinDiceHUD(QMainWindow):
         if reply == QMessageBox.StandardButton.Yes:
             self.state.reset_game()
             self.board_overlay.clear_dice()
+            if self.vision_thread is not None:
+                self.vision_thread.reset_round()
             self.refresh_all_views()
             self.lbl_status.setText("Game reset. Round 1 begins!")
 
@@ -1648,6 +2392,28 @@ class TumblinDiceHUD(QMainWindow):
         """Synchronizes all UI components with the current GameState."""
         self.banner.update_view(self.state)
         self.leaderboard.update_view(self.state)
+        if self.vision_thread is not None:
+            turn = self.state.get_current_turn()
+            if turn:
+                self.vision_thread.set_active_player(turn[0].id, turn[0].color)
+
+    def close(self) -> bool:
+        """Ensures background vision worker thread is stopped even if window wasn't visible."""
+        if hasattr(self, "mock_timer") and self.mock_timer.isActive():
+            self.mock_timer.stop()
+        if hasattr(self, "vision_thread") and self.vision_thread is not None:
+            self.vision_thread.stop()
+            self.vision_thread = None
+        return super().close()
+
+    def closeEvent(self, event: Any) -> None:
+        """Ensures background vision worker thread is stopped cleanly."""
+        if hasattr(self, "mock_timer") and self.mock_timer.isActive():
+            self.mock_timer.stop()
+        if hasattr(self, "vision_thread") and self.vision_thread is not None:
+            self.vision_thread.stop()
+            self.vision_thread = None
+        super().closeEvent(event)
 
 
 # ============================================================================
@@ -1657,16 +2423,37 @@ class TumblinDiceHUD(QMainWindow):
 def main() -> None:
     """Application launcher."""
     import argparse
-    parser = argparse.ArgumentParser(description="Tumblin' Dice Live Scoreboard HUD")
+    parser = argparse.ArgumentParser(description="Tumblin' Dice Live Scoreboard HUD with Automated Computer Vision")
     parser.add_argument("--players", type=int, default=4, help="Number of players (1..10)")
     parser.add_argument("--config", type=str, default=DEFAULT_CONFIG_PATH, help="Path to zones_config.json")
     parser.add_argument("--fullscreen", action="store_true", help="Launch in fullscreen mode")
+    parser.add_argument(
+        "--camera",
+        type=int,
+        nargs="?",
+        const=0,
+        default=None,
+        help="Camera device index (e.g. 0, 1) for live overhead video feed",
+    )
     parser.add_argument(
         "--mock-feed",
         action="store_true",
         help="Launch HUD with simulated roll feed and interactive mock controls",
     )
+    parser.add_argument(
+        "--demo",
+        action="store_true",
+        help="Alias for --mock-feed interactive software simulation mode",
+    )
+    parser.add_argument(
+        "--quiescence",
+        type=float,
+        default=1.2,
+        help="Motion quiescence stillness settle duration in seconds (default: 1.2s)",
+    )
     args = parser.parse_args()
+
+    mock_feed = bool(args.mock_feed or args.demo)
 
     app = QApplication.instance()
     if not app:
@@ -1675,13 +2462,19 @@ def main() -> None:
     state = GameState()
     state._init_default_players(args.players)
 
-    window = TumblinDiceHUD(state=state, config_path=args.config, mock_feed=args.mock_feed)
+    window = TumblinDiceHUD(
+        state=state,
+        config_path=args.config,
+        camera_idx=args.camera,
+        mock_feed=mock_feed,
+        quiescence_duration=args.quiescence,
+    )
     if args.fullscreen:
         window.showFullScreen()
     else:
         window.show()
 
-    if args.mock_feed:
+    if mock_feed:
         # Start auto roll automatically when launched with --mock-feed
         window.toggle_mock_feed_auto()
 

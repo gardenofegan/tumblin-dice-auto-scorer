@@ -11,11 +11,14 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 # Ensure headless Qt operation for tests
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
+import cv2
+import numpy as np
 from PyQt6.QtCore import QEvent, QPointF, Qt
 from PyQt6.QtGui import QKeyEvent
 from PyQt6.QtTest import QTest
@@ -28,6 +31,8 @@ from app import (
     MIN_SUPPORTED_PLAYERS,
     TOTAL_MAJOR_ROUNDS,
     BoardOverlayWidget,
+    DeltaDieScorer,
+    DeltaScoringResult,
     FlickRecord,
     GameState,
     LeaderboardWidget,
@@ -37,7 +42,11 @@ from app import (
     TouchScoreWidget,
     TumblinDiceHUD,
     TurnBannerWidget,
+    VisionPipelineThread,
 )
+from calibration import ScoringZone, generate_aruco_calibration_sheet
+from detection import DetectedDie, create_synthetic_board
+from motion import MotionConfig, MotionDetector, MotionResult, MotionState
 
 # Shared QApplication for test session
 app = QApplication.instance()
@@ -618,6 +627,411 @@ class TestTumblinDiceHUDIntegration(unittest.TestCase):
         self.assertEqual(len(mock_hud.state.history), initial_flicks + 1)
         self.assertIn("[MOCK FEED]", mock_hud.lbl_status.text())
         mock_hud.close()
+
+
+class TestDeltaDieScorer(unittest.TestCase):
+    """Unit tests for the DeltaDieScorer baseline tracking and scoring engine."""
+
+    def setUp(self):
+        self.scorer = DeltaDieScorer(match_distance_threshold=75.0)
+
+    def _create_mock_die(
+        self,
+        die_id: int,
+        cx: float,
+        cy: float,
+        pips: int = 4,
+        multiplier: int = 2,
+        player_id: Optional[int] = 1,
+        is_oob: bool = False,
+    ) -> DetectedDie:
+        return DetectedDie(
+            die_id=die_id,
+            center=(cx, cy),
+            bbox=(int(cx - 30), int(cy - 30), 60, 60),
+            pip_count=pips,
+            pip_confidence=0.9,
+            player_id=player_id,
+            player_name=f"Player {player_id}" if player_id else None,
+            zone_multiplier=multiplier,
+            score=pips * multiplier,
+            is_out_of_bounds=is_oob,
+        )
+
+    def test_first_flick_empty_board(self):
+        die1 = self._create_mock_die(1, 400.0, 500.0, pips=5, multiplier=2, player_id=1)
+        res = self.scorer.compute_delta([die1], active_player_id=1)
+        self.assertFalse(res.is_miss)
+        self.assertEqual(res.new_die.die_id, 1)
+        self.assertEqual(res.pips, 5)
+        self.assertEqual(res.multiplier, 2)
+        self.assertEqual(res.score, 10)
+        self.assertEqual(res.total_delta_score, 10)
+        self.assertEqual(len(self.scorer.previous_dice), 1)
+
+    def test_second_flick_identifies_new_die(self):
+        die1 = self._create_mock_die(1, 400.0, 500.0, pips=5, multiplier=2, player_id=1)
+        self.scorer.compute_delta([die1], active_player_id=1)
+
+        die1_moved = self._create_mock_die(1, 402.0, 501.0, pips=5, multiplier=2, player_id=1)
+        die2 = self._create_mock_die(2, 300.0, 350.0, pips=3, multiplier=3, player_id=2)
+
+        res = self.scorer.compute_delta([die1_moved, die2], active_player_id=2)
+        self.assertFalse(res.is_miss)
+        self.assertEqual(res.new_die.die_id, 2)
+        self.assertEqual(res.pips, 3)
+        self.assertEqual(res.multiplier, 3)
+        self.assertEqual(res.score, 9)
+        self.assertEqual(len(self.scorer.previous_dice), 2)
+
+    def test_gutter_miss_detection(self):
+        die1 = self._create_mock_die(1, 400.0, 500.0, pips=4, multiplier=2, player_id=1)
+        self.scorer.compute_delta([die1], active_player_id=1)
+
+        die1_same = self._create_mock_die(1, 400.0, 500.0, pips=4, multiplier=2, player_id=1)
+        res = self.scorer.compute_delta([die1_same], active_player_id=2)
+        self.assertTrue(res.is_miss)
+        self.assertIsNone(res.new_die)
+        self.assertEqual(res.score, 0)
+        self.assertEqual(res.pips, 0)
+        self.assertEqual(res.multiplier, 0)
+
+    def test_bumped_die_displacement_delta(self):
+        die1 = self._create_mock_die(1, 400.0, 500.0, pips=4, multiplier=2, player_id=1)
+        self.scorer.compute_delta([die1], active_player_id=1)
+
+        # Die 1 bumped from 2x (8 pts) to 4x (16 pts) -> delta = +8
+        die1_bumped = self._create_mock_die(1, 400.0, 750.0, pips=4, multiplier=4, player_id=1)
+        die2 = self._create_mock_die(2, 350.0, 480.0, pips=6, multiplier=2, player_id=2)
+
+        res = self.scorer.compute_delta([die1_bumped, die2], active_player_id=2)
+        self.assertFalse(res.is_miss)
+        self.assertEqual(res.new_die.die_id, 2)
+        self.assertEqual(res.score, 12)
+        self.assertEqual(len(res.bumped_dice), 1)
+        self.assertEqual(res.displaced_score_delta, 8)
+        self.assertEqual(res.total_delta_score, 20)
+
+    def test_reset_round_clears_baseline(self):
+        die1 = self._create_mock_die(1, 400.0, 500.0, pips=5, multiplier=2)
+        self.scorer.compute_delta([die1])
+        self.assertEqual(len(self.scorer.previous_dice), 1)
+
+        self.scorer.reset_round()
+        self.assertEqual(len(self.scorer.previous_dice), 0)
+
+    def test_undo_last_flick(self):
+        die1 = self._create_mock_die(1, 400.0, 500.0)
+        die2 = self._create_mock_die(2, 500.0, 600.0)
+        self.scorer.set_baseline([die1, die2])
+        self.assertEqual(len(self.scorer.previous_dice), 2)
+
+        self.scorer.undo_last_flick()
+        self.assertEqual(len(self.scorer.previous_dice), 1)
+        self.assertEqual(self.scorer.previous_dice[0].die_id, 1)
+
+    def test_delta_result_serialization(self):
+        die1 = self._create_mock_die(1, 400.0, 500.0, pips=6, multiplier=3)
+        res = self.scorer.compute_delta([die1], active_player_id=1)
+        data = res.to_dict()
+        self.assertEqual(data["pips"], 6)
+        self.assertEqual(data["multiplier"], 3)
+        self.assertEqual(data["score"], 18)
+        self.assertFalse(data["is_miss"])
+        self.assertIn("new_die", data)
+
+
+class TestVisionPipelineThread(unittest.TestCase):
+    """Unit tests for the background VisionPipelineThread integrating ArUco warp, motion, and settle."""
+
+    def test_thread_initialization_defaults(self):
+        thread = VisionPipelineThread(mock_feed=True, quiescence_duration=0.8)
+        self.assertTrue(thread.mock_feed)
+        self.assertIsNone(thread.camera_idx)
+        self.assertEqual(thread.quiescence_duration, 0.8)
+        self.assertIsNotNone(thread.calibrator)
+        self.assertIsNotNone(thread.motion_detector)
+        self.assertIsNotNone(thread.delta_scorer)
+
+    def test_thread_camera_mode_setup(self):
+        thread = VisionPipelineThread(camera_idx=0, mock_feed=False)
+        self.assertEqual(thread.camera_idx, 0)
+        self.assertFalse(thread.mock_feed)
+
+    def test_aruco_calibration_and_perspective_warp_mock_frame(self):
+        thread = VisionPipelineThread(mock_feed=True)
+        board_img, _ = create_synthetic_board(width=800, height=1200, zones=thread.zones)
+        sheet = generate_aruco_calibration_sheet(800, 1200)
+        board_img[0:180, 0:180] = sheet[0:180, 0:180]
+        board_img[0:180, 620:800] = sheet[0:180, 620:800]
+        board_img[1020:1200, 620:800] = sheet[1020:1200, 620:800]
+        board_img[1020:1200, 0:180] = sheet[1020:1200, 0:180]
+
+        calib_success = thread.calibrator.calibrate_from_frame(board_img)
+        self.assertTrue(calib_success)
+        self.assertIsNotNone(thread.calibrator.homography_matrix)
+
+        warped = thread.calibrator.warp_frame(board_img)
+        self.assertEqual(warped.shape, (1200, 800, 3))
+
+    def test_motion_and_quiescence_settle_sequence(self):
+        thread = VisionPipelineThread(mock_feed=True, quiescence_duration=0.3)
+        settle_events = []
+        thread.settle_event.connect(lambda d: settle_events.append(d))
+
+        sheet = generate_aruco_calibration_sheet(800, 1200)
+
+        # 1. Moving frames
+        for i in range(3):
+            t = 0.1 * i
+            dice = [{"cx": 400, "cy": 300 + i * 80, "size": 60, "pips": 4, "bg_color": (30, 30, 220), "player_id": 1}]
+            b, _ = create_synthetic_board(800, 1200, dice_specs=dice, zones=thread.zones)
+            b[0:180, 0:180] = sheet[0:180, 0:180]
+            b[0:180, 620:800] = sheet[0:180, 620:800]
+            b[1020:1200, 620:800] = sheet[1020:1200, 620:800]
+            b[1020:1200, 0:180] = sheet[1020:1200, 0:180]
+            thread._process_single_frame(b, timestamp=t)
+
+        self.assertEqual(len(settle_events), 0)
+
+        # 2. Static frame (settling begins)
+        final_dice = [{"cx": 400, "cy": 540, "size": 60, "pips": 4, "bg_color": (30, 30, 220), "player_id": 1}]
+        b_static, _ = create_synthetic_board(800, 1200, dice_specs=final_dice, zones=thread.zones)
+        b_static[0:180, 0:180] = sheet[0:180, 0:180]
+        b_static[0:180, 620:800] = sheet[0:180, 620:800]
+        b_static[1020:1200, 620:800] = sheet[1020:1200, 620:800]
+        b_static[1020:1200, 0:180] = sheet[1020:1200, 0:180]
+        thread._process_single_frame(b_static, timestamp=0.4)
+        self.assertEqual(len(settle_events), 0)
+
+        # 3. Static frame after quiescence duration (0.4 + 0.4 = 0.8s)
+        thread._process_single_frame(b_static, timestamp=0.85)
+
+        self.assertEqual(len(settle_events), 1)
+        res = settle_events[0]
+        self.assertFalse(res.is_miss)
+        self.assertEqual(res.pips, 4)
+        self.assertGreater(res.score, 0)
+
+    def test_lifecycle_pause_resume_stop(self):
+        thread = VisionPipelineThread(mock_feed=True)
+        thread.start()
+        self.assertTrue(thread.isRunning())
+
+        thread.pause()
+        self.assertTrue(thread._paused)
+        thread.resume()
+        self.assertFalse(thread._paused)
+
+        thread.stop(1000)
+        self.assertFalse(thread.isRunning())
+
+    def test_force_settle_emits_settle_event(self):
+        thread = VisionPipelineThread(mock_feed=True)
+        emitted = []
+        thread.settle_event.connect(lambda d: emitted.append(d))
+
+        thread.force_settle()
+        self.assertEqual(len(emitted), 1)
+        self.assertIsInstance(emitted[0], DeltaScoringResult)
+
+    def test_reset_round_and_player_context(self):
+        thread = VisionPipelineThread(mock_feed=True)
+        thread.set_active_player(2, "#3B82F6")
+        self.assertEqual(thread._active_player_id, 2)
+        self.assertEqual(thread._active_player_color, "#3B82F6")
+
+        thread.add_mock_die(5, 2, 300, 400, 2)
+        self.assertEqual(len(thread._mock_placed_dice), 1)
+
+        thread.reset_round()
+        self.assertEqual(len(thread._mock_placed_dice), 0)
+        self.assertEqual(len(thread.delta_scorer.previous_dice), 0)
+
+
+class TestBoardOverlayWidgetCamera(unittest.TestCase):
+    """Unit tests verifying live camera frame rendering in BoardOverlayWidget."""
+
+    def test_set_camera_frame_updates_qimage(self):
+        overlay = BoardOverlayWidget()
+        frame = np.full((1200, 800, 3), 120, dtype=np.uint8)
+
+        self.assertIsNone(overlay.latest_frame)
+        self.assertIsNone(overlay.latest_qimage)
+
+        overlay.set_camera_frame(frame)
+        self.assertIsNotNone(overlay.latest_frame)
+        self.assertIsNotNone(overlay.latest_qimage)
+        self.assertFalse(overlay.latest_qimage.isNull())
+        self.assertEqual(overlay.latest_qimage.width(), 800)
+        self.assertEqual(overlay.latest_qimage.height(), 1200)
+
+    def test_paint_event_with_and_without_frame(self):
+        overlay = BoardOverlayWidget()
+        overlay.resize(400, 600)
+        overlay.show()
+        app.processEvents()
+
+        overlay.update()
+        app.processEvents()
+
+        frame = np.zeros((1200, 800, 3), dtype=np.uint8)
+        overlay.set_camera_frame(frame)
+        overlay.update()
+        app.processEvents()
+        overlay.close()
+
+
+class TestTumblinDiceHUDVisionIntegration(unittest.TestCase):
+    """Integration tests verifying HUD reaction to vision thread events."""
+
+    def test_hud_camera_mode_initialization(self):
+        state = GameState()
+        hud = TumblinDiceHUD(state=state, camera_idx=9999, quiescence_duration=1.0)
+        self.assertEqual(hud.camera_idx, 9999)
+        self.assertIsNotNone(hud.vision_thread)
+        self.assertTrue(hasattr(hud, "lbl_cam_badge"))
+        self.assertTrue(hasattr(hud, "btn_force_settle"))
+        hud.close()
+
+    def test_hud_mock_feed_initialization(self):
+        state = GameState()
+        hud = TumblinDiceHUD(state=state, mock_feed=True)
+        self.assertTrue(hud.mock_feed)
+        self.assertIsNotNone(hud.vision_thread)
+        self.assertTrue(hud.vision_thread.isRunning())
+        hud.close()
+
+    def test_on_vision_settle_scores_flick(self):
+        state = GameState()
+        hud = TumblinDiceHUD(state=state, mock_feed=False)
+
+        mock_die = DetectedDie(
+            die_id=1,
+            center=(400.0, 600.0),
+            bbox=(370, 570, 60, 60),
+            pip_count=5,
+            pip_confidence=0.95,
+            player_id=1,
+            player_name="Player 1",
+            zone_multiplier=3,
+            score=15,
+        )
+        delta = DeltaScoringResult(
+            new_die=mock_die,
+            pips=5,
+            multiplier=3,
+            score=15,
+            is_miss=False,
+            total_delta_score=15,
+        )
+
+        hud.on_vision_settle(delta)
+        self.assertEqual(state.players[0].round_score(1), 15)
+        self.assertEqual(state.get_active_player().name, "Player 2")
+        self.assertIn("15 pts", hud.lbl_status.text())
+        hud.close()
+
+    def test_on_vision_settle_gutter_miss(self):
+        state = GameState()
+        hud = TumblinDiceHUD(state=state, mock_feed=False)
+
+        delta = DeltaScoringResult(
+            new_die=None,
+            pips=0,
+            multiplier=0,
+            score=0,
+            is_miss=True,
+        )
+
+        hud.on_vision_settle(delta)
+        self.assertEqual(state.players[0].round_score(1), 0)
+        self.assertEqual(state.get_active_player().name, "Player 2")
+        self.assertTrue(state.history[0].is_miss)
+        self.assertIn("Gutter Miss (0 pts)", hud.lbl_status.text())
+        hud.close()
+
+    def test_on_motion_status_updates(self):
+        hud = TumblinDiceHUD(state=GameState(), mock_feed=False)
+
+        m_moving = MotionResult(
+            state=MotionState.MOVING,
+            movement_score=850.0,
+            motion_detected=True,
+            is_settled=False,
+            is_scoreboard_frozen=True,
+            just_settled=False,
+            stillness_duration=0.0,
+            quiescence_progress=0.0,
+            timestamp=1.0,
+        )
+        hud.on_motion_status(m_moving)
+        self.assertIn("ROLLING...", hud.lbl_status.text())
+
+        m_settling = MotionResult(
+            state=MotionState.SETTLING,
+            movement_score=0.0,
+            motion_detected=False,
+            is_settled=False,
+            is_scoreboard_frozen=True,
+            just_settled=False,
+            stillness_duration=0.6,
+            quiescence_progress=0.5,
+            timestamp=1.6,
+        )
+        hud.on_motion_status(m_settling)
+        self.assertIn("SETTLING...", hud.lbl_status.text())
+        self.assertIn("50%", hud.lbl_status.text())
+        hud.close()
+
+    def test_calibration_badge_signal(self):
+        hud = TumblinDiceHUD(state=GameState(), mock_feed=False)
+        hud.on_calibration_status(True)
+        self.assertIn("Warped", hud.lbl_cal_badge.text())
+        hud.on_calibration_status(False)
+        self.assertIn("Scan", hud.lbl_cal_badge.text())
+        hud.close()
+
+    def test_advance_round_resets_vision_baseline(self):
+        state = GameState()
+        hud = TumblinDiceHUD(state=state, mock_feed=True)
+        hud.vision_thread.add_mock_die(4, 2, 350, 400, 1)
+        self.assertEqual(len(hud.vision_thread._mock_placed_dice), 1)
+
+        # Complete round 1
+        for _ in range(state.total_turns_per_round):
+            state.record_flick(score=5)
+        hud.advance_round()
+
+        self.assertEqual(len(hud.vision_thread._mock_placed_dice), 0)
+        hud.close()
+
+
+class TestCommandLineInterface(unittest.TestCase):
+    """Unit tests for the CLI entrypoint arguments."""
+
+    def test_cli_help_flag(self):
+        import subprocess
+        res = subprocess.run(
+            [sys.executable, "app.py", "--help"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("--camera", res.stdout)
+        self.assertIn("--mock-feed", res.stdout)
+        self.assertIn("--demo", res.stdout)
+        self.assertIn("--quiescence", res.stdout)
+
+    def test_cli_mock_feed_help(self):
+        import subprocess
+        res = subprocess.run(
+            [sys.executable, "app.py", "--mock-feed", "--help"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("--mock-feed", res.stdout)
 
 
 if __name__ == "__main__":
