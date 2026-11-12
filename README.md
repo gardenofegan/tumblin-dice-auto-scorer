@@ -99,3 +99,4 @@ When setting up your camera above the wooden board for the first time:
      - **0 / Miss**: Immediately marks a roll as off the board or scratch.
      - **Numeric keys**: Allows the operator or player to adjust or confirm any roll with a single tap.
      - **Confirm**: Advances turn to the next player.
+
