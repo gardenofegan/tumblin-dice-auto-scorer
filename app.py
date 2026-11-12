@@ -307,6 +307,8 @@ class Player:
     name: str
     color: str  # Hex code e.g. "#EF4444"
     flicks: Dict[int, List[int]] = field(default_factory=dict)
+    hsv_mean: Optional[Tuple[float, float, float]] = None
+    display_bgr: Optional[Tuple[int, int, int]] = None
 
     def __post_init__(self) -> None:
         if not self.flicks:
@@ -336,17 +338,25 @@ class Player:
             "name": self.name,
             "color": self.color,
             "flicks": {str(k): v for k, v in self.flicks.items()},
+            "hsv_mean": list(self.hsv_mean) if self.hsv_mean else None,
+            "display_bgr": list(self.display_bgr) if self.display_bgr else None,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> Player:
         flicks_raw = data.get("flicks", {})
         flicks = {int(k): list(v) for k, v in flicks_raw.items()}
+        hsv_raw = data.get("hsv_mean")
+        hsv_mean = tuple(hsv_raw) if hsv_raw else None
+        bgr_raw = data.get("display_bgr")
+        display_bgr = tuple(bgr_raw) if bgr_raw else None
         return cls(
             id=int(data["id"]),
             name=str(data["name"]),
             color=str(data["color"]),
             flicks=flicks,
+            hsv_mean=hsv_mean,
+            display_bgr=display_bgr,
         )
 
 
@@ -724,8 +734,12 @@ class DeltaDieScorer:
         """
         Compares currently detected dice against previous resting dice.
         Returns DeltaScoringResult detailing new die, bumps, and flick score.
+        Any dice in the start/launch zone are completely excluded from scoring.
         """
-        valid_current = [d for d in current_dice if not d.is_out_of_bounds and d.zone_multiplier > 0]
+        valid_current = [
+            d for d in current_dice
+            if not d.is_out_of_bounds and d.zone_multiplier > 0 and not getattr(d, "is_launch_zone", False)
+        ]
 
         matched_curr_indices = set()
         matched_prev_indices = set()
@@ -920,17 +934,53 @@ class VisionPipelineThread(QThread):
                     except Exception:
                         pass
                 if self.zones:
+                    has_launch = any(getattr(z, "is_launch_zone", False) for z in self.zones)
+                    if not has_launch:
+                        launch_zone = ScoringZone(
+                            name="Start / Launch Zone",
+                            multiplier=0,
+                            points=[(0.0, 0.0), (float(self.board_width), 0.0), (float(self.board_width), 180.0), (0.0, 180.0)],
+                            color=(100, 100, 100),
+                        )
+                        self.zones.append(launch_zone)
                     return
             except Exception as e:
                 logger.warning("Could not load zones from %s: %s", self.config_path, e)
 
-        # Fallback tiered zones
+        # Fallback tiered zones with 0x Start/Launch zone at the top of the board
         self.zones = [
             ScoringZone("Zone 1x", 1, [(100, 200), (700, 200), (700, 400), (100, 400)], (255, 140, 0)),
             ScoringZone("Zone 2x", 2, [(100, 400), (700, 400), (700, 650), (100, 650)], (50, 205, 50)),
             ScoringZone("Zone 3x", 3, [(100, 650), (700, 650), (700, 900), (100, 900)], (30, 30, 220)),
             ScoringZone("Zone 4x", 4, [(100, 900), (700, 900), (700, 1100), (100, 1100)], (0, 165, 255)),
+            ScoringZone("Start / Launch Zone", 0, [(0.0, 0.0), (800.0, 0.0), (800.0, 180.0), (0.0, 180.0)], (100, 100, 100)),
         ]
+
+    def update_player_roster(self, players: Sequence[Player]) -> None:
+        """Updates player manager profiles with configured players and HSV color samples."""
+        self.player_manager.profiles.clear()
+        for p in players:
+            hsv = getattr(p, "hsv_mean", None)
+            bgr = getattr(p, "display_bgr", None)
+            if hsv is None or bgr is None:
+                hex_str = p.color.lstrip("#")
+                try:
+                    r, g, b = tuple(int(hex_str[i:i+2], 16) for i in (0, 2, 4))
+                except Exception:
+                    r, g, b = (239, 68, 68)
+                bgr = (b, g, r)
+                bgr_pix = np.uint8([[[b, g, r]]])
+                hsv_pix = cv2.cvtColor(bgr_pix, cv2.COLOR_BGR2HSV)[0][0]
+                hsv = (float(hsv_pix[0]), float(hsv_pix[1]), float(hsv_pix[2]))
+
+            profile = PlayerProfile(
+                player_id=p.id,
+                name=p.name,
+                color_name=p.name,
+                hsv_mean=hsv,
+                display_bgr=bgr,
+            )
+            self.player_manager.add_profile(profile)
 
     def set_active_player(self, player_id: int, color_hex: str) -> None:
         """Updates active player context for color matching and delta scoring."""
@@ -1007,6 +1057,13 @@ class VisionPipelineThread(QThread):
         else:
             warped = np.full((self.board_height, self.board_width, 3), 200, dtype=np.uint8)
         scoring_res, _ = self.detection_pipeline.process_frame(warped)
+        launch_dice = [
+            d for d in scoring_res.dice
+            if getattr(d, "is_launch_zone", False) or d.center[1] <= 180.0
+        ]
+        if launch_dice:
+            logger.info("Force settle ignored: %d die resting in start/launch zone.", len(launch_dice))
+            return
         delta = self.delta_scorer.compute_delta(
             scoring_res.dice,
             active_player_id=self._active_player_id,
@@ -1164,11 +1221,25 @@ class VisionPipelineThread(QThread):
         if motion_res.just_settled:
             self._mock_last_settle_time = now
             scoring_res, _ = self.detection_pipeline.process_frame(warped)
-            delta = self.delta_scorer.compute_delta(
-                scoring_res.dice,
-                active_player_id=self._active_player_id,
-            )
-            self.settle_event.emit(delta)
+
+            # Start/Launch Zone Enforcement:
+            # Any dice resting in or placed inside this launch zone are completely ignored
+            # by the CV scoring engine and never trigger a settle event, score calculation, or turn advance.
+            launch_dice = [
+                d for d in scoring_res.dice
+                if getattr(d, "is_launch_zone", False) or d.center[1] <= 180.0
+            ]
+            if launch_dice:
+                logger.info(
+                    "CV scoring engine suppressed settle event: %d dice resting in start/launch zone.",
+                    len(launch_dice),
+                )
+            else:
+                delta = self.delta_scorer.compute_delta(
+                    scoring_res.dice,
+                    active_player_id=self._active_player_id,
+                )
+                self.settle_event.emit(delta)
 
         # 4. Render Live HUD Broadcast Frame
         annotated = self._render_live_hud(warped, motion_res)
@@ -1185,9 +1256,17 @@ class VisionPipelineThread(QThread):
         # 2. Overlay detected dice badges from last snapshot
         if self.detection_pipeline.current_result:
             for d in self.detection_pipeline.current_result.dice:
-                if d.zone_multiplier > 0 and not d.is_out_of_bounds:
+                cx, cy = int(d.center[0]), int(d.center[1])
+                if getattr(d, "is_launch_zone", False):
+                    # Start/launch zone badge
+                    cv2.circle(output, (cx, cy), 30, (120, 120, 120), 2, cv2.LINE_AA)
+                    cv2.circle(output, (cx, cy), 3, (255, 255, 255), -1, cv2.LINE_AA)
+                    pname = d.player_name or f"Player {d.player_id}"
+                    badge = f"{pname}: START ZONE (0x)"
+                    cv2.putText(output, badge, (max(10, cx - 60), max(25, cy - 36)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 3, cv2.LINE_AA)
+                    cv2.putText(output, badge, (max(10, cx - 60), max(25, cy - 36)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1, cv2.LINE_AA)
+                elif d.zone_multiplier > 0 and not d.is_out_of_bounds:
                     color = d.display_bgr if d.player_id else (255, 255, 255)
-                    cx, cy = int(d.center[0]), int(d.center[1])
                     cv2.circle(output, (cx, cy), 30, color, 3, cv2.LINE_AA)
                     cv2.circle(output, (cx, cy), 3, (255, 255, 255), -1, cv2.LINE_AA)
                     pname = d.player_name or f"Player {d.player_id}"
@@ -1491,12 +1570,13 @@ class LeaderboardWidget(QFrame):
 
 class TouchScoreWidget(QFrame):
     """
-    Surface Touch-Optimized Input Controls.
-    Includes:
-    - Giant Spacebar / "0 / MISS (SPACE)" button (minimum height 74px)
-    - Touch Keypad for Pip Count (1..6)
-    - Touch Keypad for Multipliers (1x..6x)
-    - Live Score Preview & Big Green Confirm Button (minimum height 60px)
+    Surface Pro 9 Touch-Optimized Vertical Keypad.
+    Features:
+    - Giant 0 / MISS action button (minimum height 74px)
+    - Vertical touch keypad for Pip selection (1..6)
+    - Vertical touch keypad for Zone multipliers (1x..6x)
+    - Giant Green Confirm action button (minimum height 74px)
+    - Live score calculation preview
     - Large Undo & Round Action buttons
     """
 
@@ -1515,89 +1595,99 @@ class TouchScoreWidget(QFrame):
 
     def init_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(8)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
 
-        # 1. Sleek Prominent Miss Button (Spacebar Override)
+        # 1. Calculation Live Preview Card
+        self.lbl_calc_preview = QLabel("1 pip × 1x = 1 pt")
+        self.lbl_calc_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_calc_preview.setStyleSheet(
+            "background-color: #0F172A; color: #38BDF8; font-size: 16px; font-weight: 800; "
+            "padding: 10px; border-radius: 8px; border: 1px solid #334155;"
+        )
+        layout.addWidget(self.lbl_calc_preview)
+
+        # 2. Giant Prominent Miss Button (0 / MISS)
         self.btn_miss = TouchButton(
             "0 / MISS  [SPACE]",
-            min_height=42,
+            min_height=74,
             parent=self,
         )
         self.btn_miss.setObjectName("missButton")
         self.btn_miss.setStyleSheet(
-            "background-color: #DC2626; color: #FFFFFF; font-size: 15px; font-weight: 800; "
-            "border-radius: 8px; border: 1px solid #EF4444;"
+            "background-color: #DC2626; color: #FFFFFF; font-size: 18px; font-weight: 900; "
+            "border-radius: 10px; border: 2px solid #EF4444; letter-spacing: 1px;"
         )
         self.btn_miss.setToolTip("Record 0 points (die off board / gutter) and advance turn [Space]")
         self.btn_miss.clicked.connect(self._on_miss_clicked)
         layout.addWidget(self.btn_miss)
 
-        # 2. Compact Combined Selector Rows: Pips & Multipliers
-        selector_grid = QGridLayout()
-        selector_grid.setContentsMargins(0, 0, 0, 0)
-        selector_grid.setHorizontalSpacing(8)
-        selector_grid.setVerticalSpacing(4)
+        # 3. Pip Keypad Grid (1..6)
+        lbl_pips = QLabel("SELECT PIPS:")
+        lbl_pips.setStyleSheet("font-size: 12px; font-weight: 800; color: #94A3B8; margin-top: 4px;")
+        layout.addWidget(lbl_pips)
 
-        lbl_pips = QLabel("PIPS:")
-        lbl_pips.setStyleSheet("font-size: 12px; font-weight: 800; color: #94A3B8; min-width: 45px;")
-        selector_grid.addWidget(lbl_pips, 0, 0)
-
-        pip_row = QHBoxLayout()
-        pip_row.setSpacing(6)
+        pip_grid = QGridLayout()
+        pip_grid.setSpacing(8)
         self.pip_buttons: List[QPushButton] = []
         for i in range(1, 7):
-            btn = TouchButton(str(i), min_height=36, min_width=38)
+            btn = TouchButton(str(i), min_height=48, min_width=48)
             btn.setProperty("class", "gridSelectorBtn")
-            btn.setStyleSheet("font-size: 14px; font-weight: 700;")
+            btn.setStyleSheet("font-size: 16px; font-weight: 800; border-radius: 8px;")
             btn.setCheckable(True)
             btn.clicked.connect(lambda checked, val=i: self.select_pip(val))
-            pip_row.addWidget(btn)
+            row = (i - 1) // 3
+            col = (i - 1) % 3
+            pip_grid.addWidget(btn, row, col)
             self.pip_buttons.append(btn)
-        selector_grid.addLayout(pip_row, 0, 1)
+        layout.addLayout(pip_grid)
 
-        lbl_mult = QLabel("ZONE:")
-        lbl_mult.setStyleSheet("font-size: 12px; font-weight: 800; color: #94A3B8; min-width: 45px;")
-        selector_grid.addWidget(lbl_mult, 1, 0)
+        # 4. Multiplier Keypad Grid (1x..6x)
+        lbl_mult = QLabel("ZONE MULTIPLIER:")
+        lbl_mult.setStyleSheet("font-size: 12px; font-weight: 800; color: #94A3B8; margin-top: 4px;")
+        layout.addWidget(lbl_mult)
 
-        mult_row = QHBoxLayout()
-        mult_row.setSpacing(6)
+        mult_grid = QGridLayout()
+        mult_grid.setSpacing(8)
         self.mult_buttons: List[QPushButton] = []
         for i in range(1, 7):
-            btn = TouchButton(f"{i}x", min_height=36, min_width=38)
+            btn = TouchButton(f"{i}x", min_height=48, min_width=48)
             btn.setProperty("class", "gridSelectorBtn")
-            btn.setStyleSheet("font-size: 14px; font-weight: 700;")
+            btn.setStyleSheet("font-size: 16px; font-weight: 800; border-radius: 8px;")
             btn.setCheckable(True)
             btn.clicked.connect(lambda checked, val=i: self.select_multiplier(val))
-            mult_row.addWidget(btn)
+            row = (i - 1) // 3
+            col = (i - 1) % 3
+            mult_grid.addWidget(btn, row, col)
             self.mult_buttons.append(btn)
-        selector_grid.addLayout(mult_row, 1, 1)
+        layout.addLayout(mult_grid)
 
-        layout.addLayout(selector_grid)
+        layout.addStretch(1)
 
-        # 3. Action Bar: Confirm & Undo in clean single row
-        action_row = QHBoxLayout()
-        action_row.setSpacing(8)
-
+        # 5. Giant Prominent Confirm Button
         self.btn_confirm = TouchButton(
-            "✓ CONFIRM: 1 PT [ENTER]",
-            min_height=42,
+            "✓ CONFIRM: 1 PT  [ENTER]",
+            min_height=74,
             parent=self,
         )
         self.btn_confirm.setObjectName("confirmButton")
         self.btn_confirm.setStyleSheet(
-            "background-color: #10B981; color: #042F2E; font-size: 14px; font-weight: 800; "
-            "border-radius: 8px; border: 1px solid #34D399;"
+            "background-color: #10B981; color: #042F2E; font-size: 18px; font-weight: 900; "
+            "border-radius: 10px; border: 2px solid #34D399; letter-spacing: 0.5px;"
         )
         self.btn_confirm.clicked.connect(self._on_confirm_clicked)
-        action_row.addWidget(self.btn_confirm, stretch=3)
+        layout.addWidget(self.btn_confirm)
 
-        self.btn_undo = TouchButton("↩ Undo [Ctrl+Z]", min_height=42, min_width=110)
+        # 6. Secondary Action Buttons (Undo & Next Round)
+        action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+
+        self.btn_undo = TouchButton("↩ Undo [Ctrl+Z]", min_height=44)
         self.btn_undo.setStyleSheet("background-color: #475569; font-size: 13px; font-weight: 600; border-radius: 8px;")
         self.btn_undo.clicked.connect(self.undo_triggered.emit)
         action_row.addWidget(self.btn_undo, stretch=1)
 
-        self.btn_next_round = TouchButton("Next Round ➔", min_height=42, min_width=120)
+        self.btn_next_round = TouchButton("Next Round ➔", min_height=44)
         self.btn_next_round.setStyleSheet("background-color: #2563EB; font-size: 14px; font-weight: bold; border-radius: 8px;")
         self.btn_next_round.clicked.connect(self.next_round_triggered.emit)
         self.btn_next_round.setVisible(False)
@@ -1629,7 +1719,7 @@ class TouchScoreWidget(QFrame):
             self.lbl_calc_preview.setText(
                 f"Calculation: {self.selected_pip} pips × {self.selected_multiplier}x = {pts} pts"
             )
-        self.btn_confirm.setText(f"✓ CONFIRM: {pts} PTS [ENTER]")
+        self.btn_confirm.setText(f"✓ CONFIRM: {pts} PTS  [ENTER]")
 
     def _on_confirm_clicked(self) -> None:
         score = self.selected_pip * self.selected_multiplier
@@ -1681,6 +1771,10 @@ class BoardOverlayWidget(QFrame):
         self.latest_qimage = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
         self.update()
 
+    def sizeHint(self) -> QSize:
+        """Preferred size preserving 2:3 vertical aspect ratio tailored for Surface Pro 9 center column."""
+        return QSize(540, 810)
+
     def load_zones(self) -> None:
         """Loads scoring zones and board dimensions from zones_config.json if available."""
         if os.path.exists(self.config_path):
@@ -1691,16 +1785,25 @@ class BoardOverlayWidget(QFrame):
                 self.board_width = dims.get("width", 800)
                 self.board_height = dims.get("height", 1200)
                 self.zones = data.get("zones", [])
+                has_launch = any((z.get("multiplier") == 0 or "launch" in z.get("name", "").lower()) for z in self.zones)
+                if not has_launch:
+                    self.zones.append({
+                        "name": "Start / Launch Zone",
+                        "multiplier": 0,
+                        "points": [[0, 0], [self.board_width, 0], [self.board_width, 180], [0, 180]],
+                        "color": [100, 100, 100],
+                    })
                 return
             except Exception as e:
                 logger.warning("Failed to load zones_config.json: %s", e)
 
-        # Fallback synthetic tiered zones
+        # Fallback synthetic tiered zones with 0x Start/Launch zone
         self.zones = [
             {"name": "Zone 1x", "multiplier": 1, "points": [[100, 200], [700, 200], [700, 400], [100, 400]], "color": [0, 140, 255]},
             {"name": "Zone 2x", "multiplier": 2, "points": [[100, 400], [700, 400], [700, 650], [100, 650]], "color": [50, 205, 50]},
             {"name": "Zone 3x", "multiplier": 3, "points": [[100, 650], [700, 650], [700, 900], [100, 900]], "color": [220, 30, 30]},
             {"name": "Zone 4x", "multiplier": 4, "points": [[100, 900], [700, 900], [700, 1100], [100, 1100]], "color": [255, 165, 0]},
+            {"name": "Start / Launch Zone", "multiplier": 0, "points": [[0, 0], [800, 0], [800, 180], [0, 180]], "color": [100, 100, 100]},
         ]
 
     def add_die_pin(self, x: float, y: float, player_color: str, pips: int, multiplier: int) -> None:
@@ -1792,12 +1895,15 @@ class BoardOverlayWidget(QFrame):
 
                 # Zone label
                 mult = zone.get("multiplier", 1)
+                name = zone.get("name", "")
+                is_launch = (mult == 0) or any(k in name.lower() for k in ["launch", "start", "setup"])
+                label_text = "0x START" if is_launch else f"{mult}x"
                 painter.setPen(QPen(QColor("#FFFFFF")))
-                painter.setFont(QFont("Segoe UI", 13, QFont.Weight.Bold))
+                painter.setFont(QFont("Segoe UI", 12 if is_launch else 13, QFont.Weight.Bold))
                 painter.drawText(
-                    QRectF(centroid_x - 30, centroid_y - 15, 60, 30),
+                    QRectF(centroid_x - 45 if is_launch else centroid_x - 30, centroid_y - 15, 90 if is_launch else 60, 30),
                     Qt.AlignmentFlag.AlignCenter,
-                    f"{mult}x",
+                    label_text,
                 )
 
             # Draw Placed Dice
@@ -1851,74 +1957,480 @@ class BoardOverlayWidget(QFrame):
         return inside
 
 
-class PlayerSetupDialog(QDialog):
-    """Touch-friendly dialog to configure player names, count (1..10), and colors."""
+class VideoDropperWidget(QWidget):
+    """
+    Interactive camera/video feed widget for sampling HSV color profiles.
+    Allows clicking on any die in the feed to sample its color, or places a center
+    reticle for placing a die directly under the camera to auto-sample.
+    """
+    color_sampled = pyqtSignal(tuple, tuple, str)  # (H, S, V), (B, G, R), hex_color
 
-    def __init__(self, current_players: List[Player], parent: Optional[QWidget] = None) -> None:
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Configure Players (Up to 10)")
-        self.setMinimumSize(480, 520)
+        self.setMinimumSize(320, 360)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.current_frame: Optional[np.ndarray] = None
+        self.last_click_point: Optional[Tuple[int, int]] = None  # frame coords
+        self.sampler = HSVColorSampler()
+
+    def set_frame(self, frame: np.ndarray) -> None:
+        if frame is None or frame.size == 0:
+            return
+        self.current_frame = frame.copy()
+        self.update()
+
+    def sample_at_point(self, fx: int, fy: int) -> Optional[Tuple[Tuple[float, float, float], Tuple[int, int, int], str]]:
+        """Samples HSV color around (fx, fy) in the video frame."""
+        if self.current_frame is None or self.current_frame.size == 0:
+            return None
+        h, w = self.current_frame.shape[:2]
+        fx = max(0, min(w - 1, fx))
+        fy = max(0, min(h - 1, fy))
+        self.last_click_point = (fx, fy)
+
+        # Extract 24x24 ROI around click point
+        r = 12
+        y1, y2 = max(0, fy - r), min(h, fy + r)
+        x1, x2 = max(0, fx - r), min(w, fx + r)
+        roi = self.current_frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            return None
+
+        try:
+            hsv = self.sampler.sample_color_from_roi(roi, exclude_pips=True)
+        except Exception:
+            try:
+                hsv = self.sampler.sample_color_from_roi(roi, exclude_pips=False)
+            except Exception:
+                hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+                hsv = (float(np.mean(hsv_roi[:, :, 0])), float(np.mean(hsv_roi[:, :, 1])), float(np.mean(hsv_roi[:, :, 2])))
+
+        # Convert to BGR & Hex
+        bgr_pix = cv2.cvtColor(np.uint8([[[int(hsv[0]), int(hsv[1]), int(hsv[2])]]]), cv2.COLOR_HSV2BGR)[0][0]
+        bgr = (int(bgr_pix[0]), int(bgr_pix[1]), int(bgr_pix[2]))
+        hex_code = f"#{bgr[2]:02X}{bgr[1]:02X}{bgr[0]:02X}"
+
+        self.color_sampled.emit(hsv, bgr, hex_code)
+        self.update()
+        return hsv, bgr, hex_code
+
+    def sample_center_die(self) -> Optional[Tuple[Tuple[float, float, float], Tuple[int, int, int], str]]:
+        """Samples the die placed in the center reticle under the camera."""
+        if self.current_frame is None or self.current_frame.size == 0:
+            return None
+        h, w = self.current_frame.shape[:2]
+        return self.sample_at_point(w // 2, h // 2)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if self.current_frame is None or self.current_frame.size == 0:
+            return
+        fh, fw = self.current_frame.shape[:2]
+        ww, wh = self.width(), self.height()
+        scale = min(ww / fw, wh / fh)
+        off_x = (ww - fw * scale) / 2
+        off_y = (wh - fh * scale) / 2
+
+        pos = event.position() if hasattr(event, "position") else event.pos()
+        wx, wy = pos.x(), pos.y()
+        fx = int((wx - off_x) / scale)
+        fy = int((wy - off_y) / scale)
+
+        if 0 <= fx < fw and 0 <= fy < fh:
+            self.sample_at_point(fx, fy)
+
+    def paintEvent(self, event: Any) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#0B0F19"))
+
+        if self.current_frame is None or self.current_frame.size == 0:
+            painter.setPen(QPen(QColor("#64748B")))
+            painter.setFont(QFont("Segoe UI", 13))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No video feed.\nClick to test dropper.")
+            return
+
+        fh, fw = self.current_frame.shape[:2]
+        ww, wh = self.width(), self.height()
+        scale = min(ww / fw, wh / fh)
+        dw, dh = int(fw * scale), int(fh * scale)
+        off_x, off_y = int((ww - dw) / 2), int((wh - dh) / 2)
+
+        rgb = cv2.cvtColor(self.current_frame, cv2.COLOR_BGR2RGB)
+        qimg = QImage(rgb.data, fw, fh, fw * 3, QImage.Format.Format_RGB888)
+        dest_rect = QRect(off_x, off_y, dw, dh)
+        painter.drawImage(dest_rect, qimg)
+
+        # Draw frame border
+        painter.setPen(QPen(QColor("#38BDF8"), 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(dest_rect)
+
+        # Draw center reticle
+        cx = off_x + dw // 2
+        cy = off_y + dh // 2
+        rw, rh = int(60 * scale), int(60 * scale)
+        painter.setPen(QPen(QColor("#F59E0B"), 2, Qt.PenStyle.DashLine))
+        painter.drawRect(cx - rw // 2, cy - rh // 2, rw, rh)
+        painter.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
+        painter.setPen(QPen(QColor("#F59E0B")))
+        painter.drawText(QRectF(cx - 80, cy + rh // 2 + 4, 160, 20), Qt.AlignmentFlag.AlignCenter, "🎯 Reticle")
+
+        # Draw last click dropper indicator
+        if self.last_click_point is not None:
+            lfx, lfy = self.last_click_point
+            lwx = off_x + int(lfx * scale)
+            lwy = off_y + int(lfy * scale)
+            painter.setPen(QPen(QColor("#FFFFFF"), 2))
+            painter.drawEllipse(QPoint(lwx, lwy), 10, 10)
+            painter.setPen(QPen(QColor("#38BDF8"), 2))
+            painter.drawEllipse(QPoint(lwx, lwy), 16, 16)
+            painter.drawLine(lwx - 20, lwy, lwx + 20, lwy)
+            painter.drawLine(lwx, lwy - 20, lwx, lwy + 20)
+
+
+class PlayerSetupDialog(QDialog):
+    """
+    Touch-friendly dialog to configure player names, dynamic count (1..10) with Add/Remove buttons,
+    and an interactive video color dropper to calibrate player dice colors directly from live camera feed.
+    """
+
+    def __init__(
+        self,
+        current_players: List[Player],
+        parent: Optional[QWidget] = None,
+        vision_thread: Optional[Any] = None,
+        current_frame: Optional[np.ndarray] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Configure Players & Video Color Dropper (1 - 10)")
+        self.setMinimumSize(940, 600)
+        self.resize(1020, 650)
         self.setStyleSheet(SURFACE_QSS)
+
+        self.vision_thread = vision_thread
+        self.passed_frame = current_frame
+        self.selected_player_index: int = 0
+
+        # Clone players
         self.players = [Player(p.id, p.name, p.color) for p in current_players]
+        if not self.players:
+            self.players = [Player(1, "Player 1", "#EF4444")]
+
+        # Initialize HSV and display_bgr on players
+        for p in self.players:
+            if getattr(p, "hsv_mean", None) is None:
+                hex_str = p.color.lstrip("#")
+                try:
+                    r, g, b = tuple(int(hex_str[i:i+2], 16) for i in (0, 2, 4))
+                except Exception:
+                    r, g, b = (239, 68, 68)
+                bgr_pix = np.uint8([[[b, g, r]]])
+                hsv_pix = cv2.cvtColor(bgr_pix, cv2.COLOR_BGR2HSV)[0][0]
+                p.hsv_mean = (float(hsv_pix[0]), float(hsv_pix[1]), float(hsv_pix[2]))
+                p.display_bgr = (b, g, r)
+
+        self.name_inputs: List[QLineEdit] = []
+        self.color_swatches: List[QFrame] = []
+        self.row_frames: List[QFrame] = []
+
         self.init_ui()
 
     def init_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setSpacing(14)
+        root_layout = QHBoxLayout(self)
+        root_layout.setContentsMargins(16, 16, 16, 16)
+        root_layout.setSpacing(16)
 
-        header = QLabel("Tumblin' Dice Player Roster")
+        # -------------------------------------------------------------
+        # Left Pane: Player Roster with Add/Remove & Save
+        # -------------------------------------------------------------
+        left_pane = QWidget()
+        left_layout = QVBoxLayout(left_pane)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(12)
+
+        header_layout = QHBoxLayout()
+        header = QLabel("Player Roster")
         header.setStyleSheet("font-size: 20px; font-weight: bold; color: #38BDF8;")
-        layout.addWidget(header)
+        header_layout.addWidget(header)
 
-        # Player rows scroll area
+        header_layout.addStretch()
+        self.lbl_count = QLabel(f"{len(self.players)} / 10 Players")
+        self.lbl_count.setStyleSheet("font-size: 14px; font-weight: 700; color: #94A3B8;")
+        header_layout.addWidget(self.lbl_count)
+        left_layout.addLayout(header_layout)
+
+        instructions = QLabel("Tap a player row to calibrate its dice color via the Video Dropper.")
+        instructions.setStyleSheet("font-size: 13px; color: #94A3B8;")
+        instructions.setWordWrap(True)
+        left_layout.addWidget(instructions)
+
+        # Action bar: Add Player
+        action_bar = QHBoxLayout()
+        self.btn_add_player = TouchButton("+ Add Player", min_height=42, min_width=130)
+        self.btn_add_player.setStyleSheet("background-color: #059669; font-size: 14px; font-weight: bold;")
+        self.btn_add_player.clicked.connect(self.add_player)
+        action_bar.addWidget(self.btn_add_player)
+        action_bar.addStretch()
+        left_layout.addLayout(action_bar)
+
+        # Scroll area for player rows
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        container = QWidget()
-        self.rows_layout = QVBoxLayout(container)
-        self.rows_layout.setSpacing(10)
+        scroll.setStyleSheet("background-color: transparent; border: none;")
+        self.container = QWidget()
+        self.rows_layout = QVBoxLayout(self.container)
+        self.rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.rows_layout.setSpacing(8)
 
-        self.name_inputs: List[QLineEdit] = []
-        for i, player in enumerate(self.players):
-            row = QHBoxLayout()
-            color_box = QFrame()
-            color_box.setFixedSize(28, 44)
-            color_box.setStyleSheet(f"border-radius: 6px; background-color: {player.color};")
-            row.addWidget(color_box)
-
-            edit = QLineEdit(player.name)
-            edit.setMinimumHeight(44)
-            edit.setStyleSheet("font-size: 16px; padding-left: 8px;")
-            row.addWidget(edit, stretch=1)
-            self.name_inputs.append(edit)
-            self.rows_layout.addLayout(row)
-
-        scroll.setWidget(container)
-        layout.addWidget(scroll)
+        scroll.setWidget(self.container)
+        left_layout.addWidget(scroll, stretch=1)
 
         # Dialog Buttons
         btn_box = QHBoxLayout()
         btn_box.setSpacing(12)
 
-        btn_cancel = TouchButton("Cancel", min_height=50)
+        btn_cancel = TouchButton("Cancel", min_height=46)
+        btn_cancel.setStyleSheet("background-color: #475569; font-size: 14px;")
         btn_cancel.clicked.connect(self.reject)
         btn_box.addWidget(btn_cancel)
 
-        btn_save = TouchButton("Save & Start Match", min_height=50)
-        btn_save.setStyleSheet("background-color: #16A34A; color: white;")
+        btn_save = TouchButton("✓ Save & Start Match", min_height=46)
+        btn_save.setStyleSheet("background-color: #10B981; color: #042F2E; font-size: 15px; font-weight: 900;")
         btn_save.clicked.connect(self._on_save)
         btn_box.addWidget(btn_save)
 
-        layout.addLayout(btn_box)
+        left_layout.addLayout(btn_box)
+        root_layout.addWidget(left_pane, stretch=4)
+
+        # -------------------------------------------------------------
+        # Right Pane: Interactive Video Color Dropper
+        # -------------------------------------------------------------
+        right_pane = QWidget()
+        right_layout = QVBoxLayout(right_pane)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(10)
+
+        dropper_header = QLabel("🎨 Live Video Color Dropper")
+        dropper_header.setStyleSheet("font-size: 18px; font-weight: bold; color: #38BDF8;")
+        right_layout.addWidget(dropper_header)
+
+        # Banner showing which player is currently selected for calibration
+        self.lbl_cal_target = QLabel("Calibrating: Player 1")
+        self.lbl_cal_target.setStyleSheet(
+            "background-color: #1E293B; color: #F8FAFC; font-size: 14px; font-weight: 700; "
+            "padding: 8px 12px; border-radius: 8px; border: 1px solid #38BDF8;"
+        )
+        right_layout.addWidget(self.lbl_cal_target)
+
+        # Video feed view
+        self.video_dropper = VideoDropperWidget(self)
+        self.video_dropper.color_sampled.connect(self._on_color_sampled)
+        right_layout.addWidget(self.video_dropper, stretch=1)
+
+        # Controls under video feed
+        dropper_controls = QHBoxLayout()
+        dropper_controls.setSpacing(10)
+
+        self.btn_auto_sample = TouchButton("🎯 Auto-Sample Die", min_height=42, min_width=140)
+        self.btn_auto_sample.setStyleSheet("background-color: #D97706; font-size: 13px; font-weight: bold;")
+        self.btn_auto_sample.setToolTip("Place a die in the center reticle and click to sample HSV")
+        self.btn_auto_sample.clicked.connect(self._on_auto_sample_clicked)
+        dropper_controls.addWidget(self.btn_auto_sample)
+
+        self.lbl_sampled_info = QLabel("Click on die in video to sample HSV color.")
+        self.lbl_sampled_info.setStyleSheet("font-size: 12px; color: #94A3B8;")
+        self.lbl_sampled_info.setWordWrap(True)
+        dropper_controls.addWidget(self.lbl_sampled_info, stretch=1)
+
+        right_layout.addLayout(dropper_controls)
+
+        root_layout.addWidget(right_pane, stretch=5)
+
+        # Connect live video source if available
+        if self.passed_frame is not None:
+            self.video_dropper.set_frame(self.passed_frame)
+        elif self.vision_thread is not None and getattr(self.vision_thread, "_last_warped", None) is not None:
+            self.video_dropper.set_frame(self.vision_thread._last_warped)
+        else:
+            # Generate synthetic preview frame with dice of player colors
+            dice_preview = [
+                {"cx": 400, "cy": 600, "size": 60, "pips": 5, "bg_color": (30, 30, 220), "player_id": 1},
+                {"cx": 350, "cy": 450, "size": 60, "pips": 3, "bg_color": (220, 100, 30), "player_id": 2},
+            ]
+            synth_frame, _ = create_synthetic_board(800, 1200, dice_specs=dice_preview)
+            self.video_dropper.set_frame(synth_frame)
+
+        if self.vision_thread is not None:
+            try:
+                self.vision_thread.frame_ready.connect(self.video_dropper.set_frame)
+            except Exception:
+                pass
+
+        self._rebuild_roster_ui()
+
+    def _rebuild_roster_ui(self) -> None:
+        """Reconstructs player rows when players are added or removed."""
+        # Clear existing rows
+        for i in reversed(range(self.rows_layout.count())):
+            item = self.rows_layout.itemAt(i)
+            if item.widget():
+                item.widget().deleteLater()
+            elif item.layout():
+                pass
+
+        self.name_inputs.clear()
+        self.color_swatches.clear()
+        self.row_frames.clear()
+
+        # Update player count label and add button
+        self.lbl_count.setText(f"{len(self.players)} / 10 Players")
+        self.btn_add_player.setEnabled(len(self.players) < 10)
+
+        for i, player in enumerate(self.players):
+            row_frame = QFrame()
+            is_selected = (i == self.selected_player_index)
+            border_style = "2px solid #38BDF8" if is_selected else "1px solid #334155"
+            bg_style = "#1E293B" if is_selected else "#0F172A"
+            row_frame.setStyleSheet(
+                f"QFrame {{ background-color: {bg_style}; border-radius: 8px; border: {border_style}; padding: 4px; }}"
+            )
+            row_layout = QHBoxLayout(row_frame)
+            row_layout.setContentsMargins(6, 6, 6, 6)
+            row_layout.setSpacing(8)
+
+            # Selection radio/indicator button
+            btn_select = QPushButton("●" if is_selected else "○")
+            btn_select.setFixedSize(30, 36)
+            btn_select.setStyleSheet("font-size: 16px; color: #38BDF8; background: transparent; border: none;")
+            btn_select.clicked.connect(lambda checked, idx=i: self.select_player(idx))
+            row_layout.addWidget(btn_select)
+
+            # Color swatch
+            color_box = QFrame()
+            color_box.setFixedSize(32, 36)
+            color_box.setStyleSheet(f"border-radius: 6px; background-color: {player.color}; border: 1px solid #FFFFFF;")
+            row_layout.addWidget(color_box)
+            self.color_swatches.append(color_box)
+
+            # Name input field
+            edit = QLineEdit(player.name)
+            edit.setMinimumHeight(38)
+            edit.setStyleSheet("font-size: 15px; padding-left: 8px; background-color: #1E293B; border: 1px solid #475569; border-radius: 6px;")
+            edit.textChanged.connect(lambda text, idx=i: self._on_name_changed(idx, text))
+            row_layout.addWidget(edit, stretch=1)
+            self.name_inputs.append(edit)
+
+            # Remove player button
+            btn_remove = TouchButton("✕", min_height=36, min_width=36)
+            btn_remove.setStyleSheet("background-color: #7F1D1D; color: #FCA5A5; font-size: 14px; font-weight: bold; border-radius: 6px;")
+            btn_remove.setEnabled(len(self.players) > 1)
+            btn_remove.clicked.connect(lambda checked, idx=i: self.remove_player(idx))
+            row_layout.addWidget(btn_remove)
+
+            self.row_frames.append(row_frame)
+            self.rows_layout.addWidget(row_frame)
+
+        self._update_target_banner()
+
+    def _on_name_changed(self, idx: int, text: str) -> None:
+        if 0 <= idx < len(self.players):
+            self.players[idx].name = text.strip()
+            if idx == self.selected_player_index:
+                self._update_target_banner()
+
+    def select_player(self, idx: int) -> None:
+        """Selects a player to calibrate their dice color."""
+        if 0 <= idx < len(self.players):
+            self.selected_player_index = idx
+            self._rebuild_roster_ui()
+
+    def _update_target_banner(self) -> None:
+        if 0 <= self.selected_player_index < len(self.players):
+            p = self.players[self.selected_player_index]
+            self.lbl_cal_target.setText(f"Calibrating Color for: {p.name} ({p.color})")
+            self.lbl_cal_target.setStyleSheet(
+                f"background-color: #1E293B; color: #F8FAFC; font-size: 14px; font-weight: 700; "
+                f"padding: 8px 12px; border-radius: 8px; border: 2px solid {p.color};"
+            )
+
+    def add_player(self) -> None:
+        """Adds a new player up to the 10-player maximum."""
+        if len(self.players) >= 10:
+            return
+        existing_ids = {p.id for p in self.players}
+        new_id = 1
+        while new_id in existing_ids and new_id <= 10:
+            new_id += 1
+        if new_id > 10:
+            new_id = len(self.players) + 1
+
+        preset_idx = (new_id - 1) % len(DEFAULT_PLAYER_ROSTER)
+        preset = DEFAULT_PLAYER_ROSTER[preset_idx]
+        hex_color, _ = DEFAULT_PLAYER_PALETTE[preset_idx % len(DEFAULT_PLAYER_PALETTE)]
+
+        new_player = Player(new_id, f"Player {new_id}", hex_color)
+        new_player.hsv_mean = preset["hsv_mean"]
+        new_player.display_bgr = preset["display_bgr"]
+
+        self.players.append(new_player)
+        self.selected_player_index = len(self.players) - 1
+        self._rebuild_roster_ui()
+
+    def remove_player(self, idx: int) -> None:
+        """Removes a player down to the 1-player minimum."""
+        if len(self.players) <= 1:
+            return
+        if 0 <= idx < len(self.players):
+            self.players.pop(idx)
+            if self.selected_player_index >= len(self.players):
+                self.selected_player_index = len(self.players) - 1
+            self._rebuild_roster_ui()
+
+    def _on_color_sampled(self, hsv: Tuple[float, float, float], bgr: Tuple[int, int, int], hex_code: str) -> None:
+        """Callback when color dropper samples an HSV color from the video feed."""
+        if 0 <= self.selected_player_index < len(self.players):
+            player = self.players[self.selected_player_index]
+            player.color = hex_code
+            player.hsv_mean = hsv
+            player.display_bgr = bgr
+
+            # Update swatch
+            if self.selected_player_index < len(self.color_swatches):
+                self.color_swatches[self.selected_player_index].setStyleSheet(
+                    f"border-radius: 6px; background-color: {hex_code}; border: 2px solid #FFFFFF;"
+                )
+            self.lbl_sampled_info.setText(
+                f"✓ Sampled HSV ({hsv[0]:.1f}, {hsv[1]:.1f}, {hsv[2]:.1f}) -> {hex_code} assigned to {player.name}!"
+            )
+            self._update_target_banner()
+
+    def _on_auto_sample_clicked(self) -> None:
+        """Samples the die placed in the center reticle."""
+        res = self.video_dropper.sample_center_die()
+        if res is not None:
+            hsv, bgr, hex_code = res
+            self._on_color_sampled(hsv, bgr, hex_code)
+        else:
+            self.lbl_sampled_info.setText("Could not sample die from center reticle.")
 
     def _on_save(self) -> None:
         for i, edit in enumerate(self.name_inputs):
-            name = edit.text().strip()
-            if name:
-                self.players[i].name = name
+            if i < len(self.players):
+                name = edit.text().strip()
+                if name:
+                    self.players[i].name = name
         self.accept()
 
     def get_configured_players(self) -> List[Player]:
         return self.players
+
+    def closeEvent(self, event: Any) -> None:
+        if self.vision_thread is not None:
+            try:
+                self.vision_thread.frame_ready.disconnect(self.video_dropper.set_frame)
+            except Exception:
+                pass
+        super().closeEvent(event)
 
 
 # ============================================================================
@@ -1928,13 +2440,12 @@ class PlayerSetupDialog(QDialog):
 class TumblinDiceHUD(QMainWindow):
     """
     Tumblin' Dice Live Scoreboard Main Window.
-    Surface-optimized live HUD featuring:
-    - 4 Major Rounds snake turn manager
-    - Global Spacebar 0 / Miss override
-    - Live sidebar leaderboard
-    - Turn Hero banner
-    - Large tactile touch buttons
-    - Board & Zone overlay
+    Surface Pro 9-tailored widescreen 3-column layout featuring:
+    - Left Column: Leaderboard & Match Status (Hero turn banner, standings table, controls)
+    - Center Column: Maximized live video feed preserving 2:3 vertical aspect ratio
+    - Right Column: Vertical touch keypad with giant 0/Miss and Confirm actions
+    - 0x Start/Launch zone enforcement
+    - Interactive live video color dropper in player setup
     """
 
     def __init__(
@@ -1948,8 +2459,8 @@ class TumblinDiceHUD(QMainWindow):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Tumblin' Dice Automated Vision Scoreboard HUD")
-        self.setMinimumSize(1024, 700)
-        self.resize(1280, 800)
+        self.setMinimumSize(1080, 700)
+        self.resize(1380, 880)
         self.setStyleSheet(SURFACE_QSS)
 
         self.state = state if state is not None else GameState()
@@ -2003,46 +2514,70 @@ class TumblinDiceHUD(QMainWindow):
         central = QWidget(self)
         self.setCentralWidget(central)
         root_layout = QVBoxLayout(central)
-        root_layout.setContentsMargins(14, 14, 14, 14)
-        root_layout.setSpacing(12)
+        root_layout.setContentsMargins(12, 12, 12, 12)
+        root_layout.setSpacing(10)
 
-        # Top Section: Turn Hero Banner
+        # -------------------------------------------------------------
+        # 3-Column Splitter Tailored for Microsoft Surface Pro 9
+        # Left: Leaderboard & match status
+        # Center: Maximized live video feed preserving 2:3 vertical aspect ratio
+        # Right: Vertical touch keypad with giant 0/Miss and Confirm actions
+        # -------------------------------------------------------------
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.main_splitter.setObjectName("mainSplitter")
+        self.main_splitter.setHandleWidth(8)
+
+        # 1. Left Column: Leaderboard & Match Status
+        self.left_column = QWidget()
+        self.left_column.setObjectName("leftColumn")
+        left_layout = QVBoxLayout(self.left_column)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(10)
+
         self.banner = TurnBannerWidget(self)
-        root_layout.addWidget(self.banner)
+        left_layout.addWidget(self.banner)
 
-        # Middle Section: Splitter with Leaderboard (Left) and Controls/Board (Right)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setHandleWidth(8)
-
-        # Left Column: Leaderboard
         self.leaderboard = LeaderboardWidget(self)
-        splitter.addWidget(self.leaderboard)
+        left_layout.addWidget(self.leaderboard, stretch=1)
 
-        # Right Column: Board View + Touch Controls
-        right_container = QWidget()
-        right_layout = QVBoxLayout(right_container)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(8)
+        self.main_splitter.addWidget(self.left_column)
 
-        # Board & Zone Preview (Expands to fill available vertical space)
+        # 2. Center Column: Maximized live video feed preserving 2:3 vertical aspect ratio
+        self.center_column = QWidget()
+        self.center_column.setObjectName("centerColumn")
+        center_layout = QVBoxLayout(self.center_column)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.setSpacing(0)
+
         self.board_overlay = BoardOverlayWidget(config_path=self.config_path, parent=self)
         self.board_overlay.zone_selected.connect(self._on_board_zone_clicked)
-        right_layout.addWidget(self.board_overlay, stretch=1)
+        center_layout.addWidget(self.board_overlay, stretch=1)
 
-        # Compact Touch Controls Panel (Fixed sleek height, no overlap or scroll)
+        self.main_splitter.addWidget(self.center_column)
+
+        # 3. Right Column: Vertical Touch Keypad
+        self.right_column = QWidget()
+        self.right_column.setObjectName("rightColumn")
+        right_layout = QVBoxLayout(self.right_column)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+
         self.touch_controls = TouchScoreWidget(self)
-        self.touch_controls.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        self.touch_controls.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         self.touch_controls.score_confirmed.connect(self.record_score)
         self.touch_controls.miss_triggered.connect(self.on_miss_override)
         self.touch_controls.undo_triggered.connect(self.on_undo_clicked)
         self.touch_controls.next_round_triggered.connect(self.advance_round)
-        right_layout.addWidget(self.touch_controls, stretch=0)
+        right_layout.addWidget(self.touch_controls, stretch=1)
 
-        splitter.addWidget(right_container)
-        splitter.setStretchFactor(0, 4)
-        splitter.setStretchFactor(1, 5)
+        self.main_splitter.addWidget(self.right_column)
 
-        root_layout.addWidget(splitter, stretch=1)
+        # Stretch factors: Left ~3, Center ~5 (Maximized Video Feed), Right ~3
+        self.main_splitter.setStretchFactor(0, 3)
+        self.main_splitter.setStretchFactor(1, 5)
+        self.main_splitter.setStretchFactor(2, 3)
+
+        root_layout.addWidget(self.main_splitter, stretch=1)
 
         # Bottom Bar: Status Bar & Fast Utilities
         bottom_bar = QHBoxLayout()
@@ -2380,16 +2915,23 @@ class TumblinDiceHUD(QMainWindow):
         self.lbl_status.setText(f"Selected {multiplier}x zone from board view.")
 
     def open_player_setup(self) -> None:
-        """Opens touch player configuration dialog."""
-        dialog = PlayerSetupDialog(self.state.players, self)
+        """Opens touch player configuration dialog with dynamic count & video color dropper."""
+        current_frame = self.board_overlay.latest_frame
+        dialog = PlayerSetupDialog(
+            current_players=self.state.players,
+            parent=self,
+            vision_thread=self.vision_thread,
+            current_frame=current_frame,
+        )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             new_players = dialog.get_configured_players()
             self.state.reset_game(new_players)
             self.board_overlay.clear_dice()
             if self.vision_thread is not None:
                 self.vision_thread.reset_round()
+                self.vision_thread.update_player_roster(new_players)
             self.refresh_all_views()
-            self.lbl_status.setText("Player roster updated. New game started.")
+            self.lbl_status.setText(f"Player roster updated ({len(new_players)} players). New match started.")
 
     def confirm_new_game(self) -> None:
         """Prompts to restart the match."""

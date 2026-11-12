@@ -154,6 +154,11 @@ class ScoringZone:
         return (float(mean[0]), float(mean[1]))
 
     @property
+    def is_launch_zone(self) -> bool:
+        """Returns True if this zone is a start/launch/foul zone (multiplier 0 or named launch/start)."""
+        return self.multiplier == 0 or any(k in self.name.lower() for k in ["launch", "start", "setup", "foul"])
+
+    @property
     def area(self) -> float:
         """Calculates the 2D polygon area in board pixel units."""
         return float(cv2.contourArea(self.contour_float))
@@ -516,7 +521,7 @@ class ZoneManager:
 
             if show_labels:
                 cx, cy = zone.centroid
-                label = f"{zone.multiplier}x"
+                label = "0x START" if zone.is_launch_zone else f"{zone.multiplier}x"
                 font = cv2.FONT_HERSHEY_SIMPLEX
                 font_scale = 0.7
                 font_thickness = 2

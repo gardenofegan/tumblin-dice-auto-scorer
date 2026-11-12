@@ -82,6 +82,10 @@ except ImportError:
         def contour_float(self) -> np.ndarray:
             return np.array(self.points, dtype=np.float32).reshape((-1, 1, 2))
 
+        @property
+        def is_launch_zone(self) -> bool:
+            return self.multiplier == 0 or any(k in self.name.lower() for k in ["launch", "start", "setup", "foul"])
+
         def contains_point(self, x: float, y: float) -> bool:
             return cv2.pointPolygonTest(self.contour_float, (float(x), float(y)), False) >= 0.0
 
@@ -810,6 +814,7 @@ class DetectedDie:
     zone_multiplier: int = 0
     score: int = 0
     is_out_of_bounds: bool = False
+    is_launch_zone: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Serializes detected die to dictionary."""
@@ -828,6 +833,7 @@ class DetectedDie:
             "zone_multiplier": self.zone_multiplier,
             "score": self.score,
             "is_out_of_bounds": self.is_out_of_bounds,
+            "is_launch_zone": self.is_launch_zone,
         }
 
 
@@ -908,6 +914,7 @@ class DiceScoringResult:
     player_round_scores: Dict[int, PlayerRoundScore] = field(default_factory=dict)
     leaderboard: List[Dict[str, Any]] = field(default_factory=list)
     out_of_bounds_dice: List[DetectedDie] = field(default_factory=list)
+    launch_zone_dice: List[DetectedDie] = field(default_factory=list)
     unassigned_dice: List[DetectedDie] = field(default_factory=list)
     total_board_score: int = 0
     active_dice_count: int = 0
@@ -920,6 +927,7 @@ class DiceScoringResult:
             "leaderboard": self.leaderboard,
             "dice": [d.to_dict() for d in self.dice],
             "out_of_bounds_count": len(self.out_of_bounds_dice),
+            "launch_zone_count": len(self.launch_zone_dice),
             "unassigned_count": len(self.unassigned_dice),
         }
 
@@ -992,18 +1000,38 @@ class ZoneScorer:
     def score_die(self, die: DetectedDie) -> DetectedDie:
         """
         Calculates zone multiplier, score, and out-of-bounds flag for a single die.
+        Ensures dice resting in the 0x start/launch zone are marked is_launch_zone=True,
+        score=0, and multiplier=0.
         """
         zone = self.find_zone(die.center[0], die.center[1])
         if zone is not None:
+            is_launch = getattr(zone, "is_launch_zone", False) or (
+                zone.multiplier == 0 and any(k in zone.name.lower() for k in ["launch", "start", "setup"])
+            )
             die.zone_name = zone.name
             die.zone_multiplier = zone.multiplier
+            die.is_launch_zone = is_launch
             die.is_out_of_bounds = (zone.multiplier == 0)
         else:
-            die.zone_name = "Out of Bounds"
-            die.zone_multiplier = 0
-            die.is_out_of_bounds = True
+            # Check if die center is in the top launch area of the board
+            top_zone = [z for z in self.zones if getattr(z, "is_launch_zone", False)]
+            if top_zone and top_zone[0].contains_point(die.center[0], die.center[1]):
+                die.zone_name = top_zone[0].name
+                die.zone_multiplier = 0
+                die.is_launch_zone = True
+                die.is_out_of_bounds = True
+            elif die.center[1] <= 180.0 and 0.0 <= die.center[0] <= 800.0:
+                die.zone_name = "Start / Launch Zone"
+                die.zone_multiplier = 0
+                die.is_launch_zone = True
+                die.is_out_of_bounds = True
+            else:
+                die.zone_name = "Out of Bounds"
+                die.zone_multiplier = 0
+                die.is_launch_zone = False
+                die.is_out_of_bounds = True
 
-        # Formula: Score = Pip Count * Zone Multiplier (0 if out of bounds)
+        # Formula: Score = Pip Count * Zone Multiplier (0 if out of bounds or launch zone)
         die.score = die.pip_count * die.zone_multiplier if not die.is_out_of_bounds else 0
         return die
 
@@ -1014,10 +1042,12 @@ class ZoneScorer:
     ) -> DiceScoringResult:
         """
         Evaluates a collection of dice and compiles the full round scoreboard snapshot.
+        Dice resting in the start/launch zone are completely ignored by the CV scoring engine.
         """
         scored_dice: List[DetectedDie] = []
         out_of_bounds: List[DetectedDie] = []
         unassigned: List[DetectedDie] = []
+        launch_zone_dice: List[DetectedDie] = []
 
         # Initialize round score containers per registered player
         player_round_scores: Dict[int, PlayerRoundScore] = {}
@@ -1036,6 +1066,11 @@ class ZoneScorer:
         for d in dice:
             scored = self.score_die(d)
             scored_dice.append(scored)
+
+            if scored.is_launch_zone:
+                launch_zone_dice.append(scored)
+                # Completely ignored by CV scoring engine: excluded from active scored dice & player scores
+                continue
 
             if scored.is_out_of_bounds:
                 out_of_bounds.append(scored)
@@ -1084,6 +1119,7 @@ class ZoneScorer:
             player_round_scores=player_round_scores,
             leaderboard=leaderboard_entries,
             out_of_bounds_dice=out_of_bounds,
+            launch_zone_dice=launch_zone_dice,
             unassigned_dice=unassigned,
             total_board_score=total_board_score,
             active_dice_count=active_dice_count,
@@ -1401,7 +1437,12 @@ class DetectionPipeline:
             radius = max(int(max(bw, bh) * 0.55), 18)
 
             # Circular glow ring around die
-            ring_color = (0, 0, 255) if d.is_out_of_bounds else color
+            if getattr(d, "is_launch_zone", False):
+                ring_color = (120, 120, 120)
+            elif d.is_out_of_bounds:
+                ring_color = (0, 0, 255)
+            else:
+                ring_color = color
             cv2.circle(output, (cx, cy), radius, ring_color, 2, cv2.LINE_AA)
 
             # Draw center mark
@@ -1409,7 +1450,9 @@ class DetectionPipeline:
 
             # Construct badge text
             p_name = d.player_name or (f"P{d.player_id}" if d.player_id else "Unassigned")
-            if d.is_out_of_bounds:
+            if getattr(d, "is_launch_zone", False):
+                badge_text = f"{p_name} | START ZONE (0x)"
+            elif d.is_out_of_bounds:
                 badge_text = f"{p_name} | {d.pip_count}p - OUT (0pts)"
             else:
                 badge_text = f"{p_name} | {d.pip_count}x{d.zone_multiplier} = {d.score}pts"

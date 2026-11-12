@@ -1011,6 +1011,253 @@ class TestTumblinDiceHUDVisionIntegration(unittest.TestCase):
         hud.close()
 
 
+class TestSurfacePro9ThreeColumnLayout(unittest.TestCase):
+    """Unit tests for the 3-column layout tailored for Microsoft Surface Pro 9."""
+
+    def setUp(self):
+        self.state = GameState()
+        self.hud = TumblinDiceHUD(state=self.state)
+        self.hud.show()
+        app.processEvents()
+
+    def tearDown(self):
+        self.hud.close()
+        app.processEvents()
+
+    def test_three_column_structure(self):
+        # 1. Main horizontal splitter exists and has 3 columns
+        self.assertIsNotNone(self.hud.main_splitter)
+        self.assertEqual(self.hud.main_splitter.count(), 3)
+        self.assertEqual(self.hud.main_splitter.orientation(), Qt.Orientation.Horizontal)
+
+        # 2. Left column contains Leaderboard & Match Status (Banner + Leaderboard)
+        self.assertIsNotNone(self.hud.left_column)
+        self.assertEqual(self.hud.banner.parent(), self.hud.left_column)
+        self.assertEqual(self.hud.leaderboard.parent(), self.hud.left_column)
+
+        # 3. Center column contains BoardOverlayWidget
+        self.assertIsNotNone(self.hud.center_column)
+        self.assertEqual(self.hud.board_overlay.parent(), self.hud.center_column)
+
+        # 4. Right column contains vertical TouchScoreWidget
+        self.assertIsNotNone(self.hud.right_column)
+        self.assertEqual(self.hud.touch_controls.parent(), self.hud.right_column)
+
+    def test_board_overlay_preserves_two_to_three_aspect_ratio(self):
+        # Check sizeHint aspect ratio is 2:3
+        hint = self.hud.board_overlay.sizeHint()
+        self.assertGreater(hint.width(), 0)
+        self.assertGreater(hint.height(), 0)
+        # width : height = 2 : 3 -> width * 3 == height * 2
+        self.assertEqual(hint.width() * 3, hint.height() * 2)
+
+        # Check coordinate mapping preserves 2:3 ratio
+        self.assertEqual(self.hud.board_overlay.board_width, 800)
+        self.assertEqual(self.hud.board_overlay.board_height, 1200)
+
+    def test_right_column_vertical_touch_keypad_ergonomics(self):
+        touch = self.hud.touch_controls
+
+        # Giant 0 / Miss button (>= 74px min height for touch)
+        self.assertGreaterEqual(touch.btn_miss.minimumHeight(), 74)
+        self.assertIn("0 / MISS", touch.btn_miss.text())
+
+        # Giant Confirm button (>= 74px min height for touch)
+        self.assertGreaterEqual(touch.btn_confirm.minimumHeight(), 74)
+        self.assertIn("CONFIRM", touch.btn_confirm.text())
+
+        # Pip buttons (1..6) in grid
+        self.assertEqual(len(touch.pip_buttons), 6)
+        for btn in touch.pip_buttons:
+            self.assertGreaterEqual(btn.minimumHeight(), 48)
+            self.assertGreaterEqual(btn.minimumWidth(), 48)
+
+        # Multiplier buttons (1x..6x) in grid
+        self.assertEqual(len(touch.mult_buttons), 6)
+        for btn in touch.mult_buttons:
+            self.assertGreaterEqual(btn.minimumHeight(), 48)
+            self.assertGreaterEqual(btn.minimumWidth(), 48)
+
+        # Live calculation preview
+        self.assertIsNotNone(touch.lbl_calc_preview)
+        touch.select_pip(5)
+        touch.select_multiplier(4)
+        self.assertIn("20 pts", touch.lbl_calc_preview.text().lower())
+
+
+class TestStartLaunchZoneEnforcement(unittest.TestCase):
+    """
+    Unit tests confirming that the 0x Start/Launch Zone at the top of the board is
+    defined, and dice resting in or placed inside it are completely ignored by the CV scoring engine:
+    never triggering settle events, score calculations, or turn advances.
+    """
+
+    def test_launch_zone_definition_and_detection(self):
+        thread = VisionPipelineThread(mock_feed=True)
+        # Verify a launch zone is present in thread.zones
+        launch_zones = [z for z in thread.zones if getattr(z, "is_launch_zone", False)]
+        self.assertGreaterEqual(len(launch_zones), 1)
+        lz = launch_zones[0]
+        self.assertEqual(lz.multiplier, 0)
+        self.assertTrue(lz.is_launch_zone)
+
+        # Die placed in launch zone (e.g. x=400, y=100)
+        die_in_launch = DetectedDie(
+            die_id=1,
+            center=(400.0, 100.0),
+            bbox=(370, 70, 60, 60),
+            pip_count=5,
+            pip_confidence=0.95,
+            player_id=1,
+        )
+        scored = thread.zone_scorer.score_die(die_in_launch)
+        self.assertTrue(scored.is_launch_zone)
+        self.assertEqual(scored.zone_multiplier, 0)
+        self.assertEqual(scored.score, 0)
+        self.assertTrue(scored.is_out_of_bounds)
+
+        # Batch scoring excludes launch zone die from active dice and player tally
+        res = thread.zone_scorer.score_dice([scored])
+        self.assertEqual(res.active_dice_count, 0)
+        self.assertEqual(res.total_board_score, 0)
+        self.assertEqual(len(res.launch_zone_dice), 1)
+
+    def test_delta_scorer_ignores_launch_zone_dice(self):
+        scorer = DeltaDieScorer()
+        die_launch = DetectedDie(
+            die_id=1,
+            center=(400.0, 100.0),
+            bbox=(370, 70, 60, 60),
+            pip_count=6,
+            pip_confidence=0.98,
+            player_id=1,
+            zone_multiplier=0,
+            is_out_of_bounds=True,
+            is_launch_zone=True,
+            score=0,
+        )
+        res = scorer.compute_delta([die_launch], active_player_id=1)
+        # Ignored: no valid die detected on scoring board
+        self.assertTrue(res.is_miss)
+        self.assertIsNone(res.new_die)
+        self.assertEqual(res.score, 0)
+
+    def test_vision_pipeline_suppresses_settle_when_die_in_launch_zone(self):
+        thread = VisionPipelineThread(mock_feed=True, quiescence_duration=0.3)
+        settle_events = []
+        thread.settle_event.connect(lambda d: settle_events.append(d))
+
+        sheet = generate_aruco_calibration_sheet(800, 1200)
+
+        # Create frame where die is resting in the 0x Start/Launch zone (cy = 100)
+        dice_in_launch = [{"cx": 400, "cy": 100, "size": 60, "pips": 5, "bg_color": (30, 30, 220), "player_id": 1}]
+        board, _ = create_synthetic_board(800, 1200, dice_specs=dice_in_launch, zones=thread.zones)
+        board[0:180, 0:180] = sheet[0:180, 0:180]
+        board[0:180, 620:800] = sheet[0:180, 620:800]
+        board[1020:1200, 620:800] = sheet[1020:1200, 620:800]
+        board[1020:1200, 0:180] = sheet[1020:1200, 0:180]
+
+        # Feed frame through pipeline and force settle
+        thread._process_single_frame(board, timestamp=1.0)
+        thread.force_settle()
+
+        # MUST NOT trigger settle event!
+        self.assertEqual(len(settle_events), 0)
+
+    def test_vision_pipeline_emits_settle_when_die_in_scoring_zone(self):
+        thread = VisionPipelineThread(mock_feed=True, quiescence_duration=0.3)
+        settle_events = []
+        thread.settle_event.connect(lambda d: settle_events.append(d))
+
+        sheet = generate_aruco_calibration_sheet(800, 1200)
+
+        # Die flicked down into Zone 2x (cy = 500)
+        dice_in_zone = [{"cx": 400, "cy": 500, "size": 60, "pips": 4, "bg_color": (30, 30, 220), "player_id": 1}]
+        board, _ = create_synthetic_board(800, 1200, dice_specs=dice_in_zone, zones=thread.zones)
+        board[0:180, 0:180] = sheet[0:180, 0:180]
+        board[0:180, 620:800] = sheet[0:180, 620:800]
+        board[1020:1200, 620:800] = sheet[1020:1200, 620:800]
+        board[1020:1200, 0:180] = sheet[1020:1200, 0:180]
+
+        thread._process_single_frame(board, timestamp=1.0)
+        thread.force_settle()
+
+        # MUST trigger settle event since die is on scoring board
+        self.assertEqual(len(settle_events), 1)
+        res = settle_events[0]
+        self.assertFalse(res.is_miss)
+        self.assertEqual(res.pips, 4)
+        self.assertGreater(res.score, 0)
+
+
+class TestPlayerSetupDialogAndColorDropper(unittest.TestCase):
+    """Unit tests for the upgraded PlayerSetupDialog with dynamic player count (1-10) and interactive video color dropper."""
+
+    def test_dynamic_player_count_add_and_remove(self):
+        initial = [Player(1, "P1", "#EF4444"), Player(2, "P2", "#3B82F6")]
+        dlg = PlayerSetupDialog(initial)
+
+        # Initial 2 players
+        self.assertEqual(len(dlg.players), 2)
+        self.assertEqual(len(dlg.name_inputs), 2)
+
+        # Add players up to 10
+        for _ in range(8):
+            dlg.add_player()
+        self.assertEqual(len(dlg.players), 10)
+        self.assertFalse(dlg.btn_add_player.isEnabled())
+
+        # Attempt to add 11th player should be rejected
+        dlg.add_player()
+        self.assertEqual(len(dlg.players), 10)
+
+        # Remove players down to 1
+        for _ in range(9):
+            dlg.remove_player(0)
+        self.assertEqual(len(dlg.players), 1)
+
+        # Attempt to remove last player should be rejected (minimum 1 player)
+        dlg.remove_player(0)
+        self.assertEqual(len(dlg.players), 1)
+
+    def test_interactive_video_color_dropper_sampling(self):
+        initial = [Player(1, "Player 1", "#EF4444"), Player(2, "Player 2", "#3B82F6")]
+        dlg = PlayerSetupDialog(initial)
+
+        # Generate test synthetic frame with a known blue patch in center
+        test_frame = np.full((400, 600, 3), 40, dtype=np.uint8)
+        # Draw a bright cyan die at (300, 200)
+        test_frame[180:220, 280:320] = (255, 200, 30)  # BGR
+        dlg.video_dropper.set_frame(test_frame)
+
+        # Select Player 2
+        dlg.select_player(1)
+        self.assertEqual(dlg.selected_player_index, 1)
+
+        # Click at (300, 200) on the video frame
+        res = dlg.video_dropper.sample_at_point(300, 200)
+        self.assertIsNotNone(res)
+        hsv, bgr, hex_code = res
+
+        # Assigned to Player 2
+        self.assertEqual(dlg.players[1].color, hex_code)
+        self.assertIsNotNone(dlg.players[1].hsv_mean)
+
+    def test_auto_sample_die_in_reticle(self):
+        initial = [Player(1, "Player 1", "#EF4444")]
+        dlg = PlayerSetupDialog(initial)
+
+        # Synthetic frame with green center
+        test_frame = np.full((400, 600, 3), 30, dtype=np.uint8)
+        test_frame[180:220, 280:320] = (50, 205, 50)  # Lime Green BGR
+        dlg.video_dropper.set_frame(test_frame)
+
+        # Trigger auto-sample
+        dlg._on_auto_sample_clicked()
+        self.assertIn("assigned to", dlg.lbl_sampled_info.text().lower())
+        self.assertNotEqual(dlg.players[0].color, "#EF4444")
+
+
 class TestCommandLineInterface(unittest.TestCase):
     """Unit tests for the CLI entrypoint arguments."""
 
