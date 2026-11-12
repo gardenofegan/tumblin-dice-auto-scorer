@@ -34,6 +34,7 @@ from PyQt6.QtCore import (
     QEvent,
     QObject,
     QPointF,
+    QRect,
     QRectF,
     QSize,
     Qt,

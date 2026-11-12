@@ -1149,8 +1149,8 @@ class TestStartLaunchZoneEnforcement(unittest.TestCase):
 
         sheet = generate_aruco_calibration_sheet(800, 1200)
 
-        # Create frame where die is resting in the 0x Start/Launch zone (cy = 100)
-        dice_in_launch = [{"cx": 400, "cy": 100, "size": 60, "pips": 5, "bg_color": (30, 30, 220), "player_id": 1}]
+        # Create frame where die is resting in the 0x Start/Launch zone (cy = 240, inside launch polygon [0..300])
+        dice_in_launch = [{"cx": 400, "cy": 240, "size": 60, "pips": 5, "bg_color": (30, 30, 220), "player_id": 1}]
         board, _ = create_synthetic_board(800, 1200, dice_specs=dice_in_launch, zones=thread.zones)
         board[0:180, 0:180] = sheet[0:180, 0:180]
         board[0:180, 620:800] = sheet[0:180, 620:800]
