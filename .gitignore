@@ -1,6 +1,31 @@
+# Environment & Secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets.json
+
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-*.png
-zones_config.json
 .pytest_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Local Calibration & Captures
+*.png
+screenshots/
+zones_config.json
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
